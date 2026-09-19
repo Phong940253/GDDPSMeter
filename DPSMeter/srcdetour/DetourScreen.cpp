@@ -60,7 +60,8 @@ bool DetourScreen::SetupDetour()
 
     if (status != 0)
     {
-        SetError("Error in DetourScreen::SetupDetour()");
+        OutputDebugStringA("DetourScreen::SetupDetour - WARNING: some hooks failed (non-fatal)\n");
+        // SetError("Error in DetourScreen::SetupDetour()");
     }
 
     return status == 0;

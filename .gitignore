@@ -1,0 +1,8 @@
+build-vs2022/
+build/
+out/
+x64/
+Debug/
+Release/
+*.user
+.vs/

@@ -609,7 +609,11 @@ void ImGuiMain::ImGuiStartup()
     bool WindowFocus = false;
     RECT rect;
 
-    while (WindowFocus == false)
+    // First try: wait up to ~5 seconds for the GD window to become foreground.
+    // SetForegroundWindow from an external process is often blocked by Windows,
+    // so don't wait forever here.
+    int waitCount = 0;
+    while (WindowFocus == false && waitCount < 100)
     {
         GetWindowThreadProcessId(GetForegroundWindow(), &ForegroundWindowProcessID);
 
@@ -617,7 +621,6 @@ void ImGuiMain::ImGuiStartup()
         {
             _HWND = GetForegroundWindow();
             threadId = GetWindowThreadProcessId(_HWND, NULL);
-            //LOGF("grim thread id=%d(%X)\n", threadId, threadId);
             GetWindowRect(_HWND, &rect);
             ScreenWidth = rect.right - rect.left;
             ScreenHeight = rect.bottom - rect.top;
@@ -632,6 +635,53 @@ void ImGuiMain::ImGuiStartup()
             {
                 WindowFocus = true;
             }
+        }
+
+        waitCount++;
+        Sleep(50);
+    }
+
+    // Fallback (GD v1.3.x): find the GD main window directly by picking the
+    // largest client-area window owned by the game process.
+    if (!WindowFocus)
+    {
+        struct EnumData { DWORD pid; HWND bestHwnd; int bestArea; };
+        EnumData ed = { procId, NULL, 0 };
+        EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+            EnumData* ped = (EnumData*)lParam;
+            DWORD wpid;
+            GetWindowThreadProcessId(hwnd, &wpid);
+            if (wpid == ped->pid)
+            {
+                RECT clrect;
+                GetClientRect(hwnd, &clrect);
+                int area = clrect.right * clrect.bottom;
+                if (area > ped->bestArea)
+                {
+                    ped->bestArea = area;
+                    ped->bestHwnd = hwnd;
+                }
+            }
+            return TRUE;
+        }, (LPARAM)&ed);
+
+        if (ed.bestHwnd)
+        {
+            _HWND = ed.bestHwnd;
+            threadId = GetWindowThreadProcessId(_HWND, NULL);
+            GetWindowRect(_HWND, &rect);
+            ScreenWidth = rect.right - rect.left;
+            ScreenHeight = rect.bottom - rect.top;
+            ScreenLeft = rect.left;
+            ScreenRight = rect.right;
+            ScreenTop = rect.top;
+            ScreenBottom = rect.bottom;
+            WindowFocus = true;
+        }
+        else
+        {
+            LOGF("  Could not find GD window, exit");
+            return;
         }
     }
     LOGF("  hwnd=0x%X, l,t,r,b(%d,%d,%d,%d)", _HWND, rect.left, rect.top, rect.right, rect.bottom);

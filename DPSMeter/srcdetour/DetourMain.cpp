@@ -202,7 +202,10 @@ bool DetourMain::SetupDetour()
 
     if (status != 0)
     {
-        SetError("Error in DetourMain::SetupDetour()");
+        // Non-fatal on newer game versions (e.g. GD v1.3.x): some hooks may be
+        // missing. Log a warning instead of killing the game process.
+        OutputDebugStringA("DetourMain::SetupDetour - WARNING: some hooks failed (non-fatal)\n");
+        // SetError("Error in DetourMain::SetupDetour()");
     }
 
     //init child classes
