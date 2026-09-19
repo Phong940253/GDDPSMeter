@@ -57,7 +57,8 @@ bool DetourOADAStats::SetupDetour()
 
     if (status != 0)
     {
-        SetError("Error in DetourCommon::SetupDetour()");
+        OutputDebugStringA("DetourOADAStats::SetupDetour - WARNING: some hooks failed (non-fatal)\n");
+        // SetError("Error in DetourCommon::SetupDetour()");
     }
 
     return status == 0;

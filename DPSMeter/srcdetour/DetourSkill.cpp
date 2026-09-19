@@ -109,7 +109,8 @@ bool DetourSkill::SetupDetour()
 
     if (status != 0)
     {
-        SetError("Error in DetourSkill::SetupDetour()");
+        OutputDebugStringA("DetourSkill::SetupDetour - WARNING: some hooks failed (non-fatal)\n");
+        // SetError("Error in DetourSkill::SetupDetour()");
     }
 
     return status == 0;
