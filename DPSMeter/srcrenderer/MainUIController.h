@@ -9,6 +9,7 @@
 #include "SkillActive.h"
 #include "SkillCD.h"
 #include "CombatLog.h"
+#include "TeleportUI.h"
 
 
 #define MAX_COMBATLOG_LINES 50
@@ -33,6 +34,7 @@ public:
   }
 
   void SetPathName(const std::string& path);
+  void SetTeleportDetour(DetourTeleport *teleport);
   void SendKeyInput(int key);
   void SetStats(const OADAData &stats);
 
@@ -52,6 +54,7 @@ protected:
   DetailDamage detailDamage_;
   SkillActive skillActive_;
   SkillCD skillCD_;
+  TeleportUI teleportUI_;
 
   bool showOADA_;
   bool showSkillCD_;
@@ -59,6 +62,7 @@ protected:
   bool showDPSStats_;
   bool showDetailDamage_;
   bool showDispelWarning_;
+  bool showTeleport_;
 
   bool checkboxesRead_;
   bool showOnceAtStartup_;

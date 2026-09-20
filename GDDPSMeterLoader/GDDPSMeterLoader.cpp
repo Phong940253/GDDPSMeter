@@ -34,7 +34,12 @@ int main()
     DWORD dwProcessId = 0;
     bool found = false;
     bool dllLoaded = false;
-    bool hideConsole = true;
+    bool hideConsole = false;  // show console for debugging
+
+    // Write log file next to exe
+    FILE *flog = NULL;
+    fopen_s(&flog, "GDDPSMeterLoader.log", "w");
+    if (flog) fprintf(flog, "GDDPSMeterLoader started\n");
 
     if (hideConsole)
     {
@@ -43,9 +48,13 @@ int main()
 
     dwProcessId = GetProcId(GRIMDAWN);
 
+    if (flog) fprintf(flog, "GetProcId(Grim Dawn.exe) = %lu\n", dwProcessId);
+
     if (dwProcessId != 0)
     {
         HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, dwProcessId);
+
+        if (flog) fprintf(flog, "OpenProcess = %p\n", hProcess);
 
         if (hProcess)
         {
@@ -53,12 +62,16 @@ int main()
             if (GetBaseModuleHandle(dwProcessId, DPSMETERDLL))
             {
                 PopMessage(true, "GD DPSMeter is already loaded.");
+                if (flog) fprintf(flog, "Already loaded, exit\n");
+                fclose(flog);
                 return 0;
             }
 
             const int maxPathLen = 512;
             char path[maxPathLen];
             GetCurrentDirectory(maxPathLen, path);
+
+            if (flog) fprintf(flog, "CurrentDir = %s\n", path);
 
 #ifndef _RELEASE
             std::string dllPath = std::string(path) + "\\DPSMeter.dll";
@@ -69,14 +82,22 @@ int main()
 
             LPCSTR DllPath = dllPath.c_str();
 
+            if (flog) fprintf(flog, "DLL path = %s\n", DllPath);
+
 			//check for dll
 			if (!FileExists(DllPath))
 			{
 				PopMessage(true, "DPSMeter.dll missing.");
+                if (flog) fprintf(flog, "DLL NOT FOUND\n");
+                fclose(flog);
 				return 0;
 			}
 
+            if (flog) fprintf(flog, "DLL found, injecting...\n");
+
             LPVOID pDllPath = VirtualAllocEx(hProcess, 0, strlen(DllPath) + 1, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+
+            if (flog) fprintf(flog, "VirtualAllocEx = %p\n", pDllPath);
 
             if (pDllPath != NULL)
             {
@@ -102,15 +123,18 @@ int main()
                         // close LoadLibrary thread (dll is already loaded into host process)
                         CloseHandle(hLoadThread);
                         dllLoaded = true;
+                        if (flog) fprintf(flog, "DLL injected OK!\n");
                     }
                     else
                     {
                         PopMessage(true, "Remote thread failed.");
+                        if (flog) fprintf(flog, "RemoteThread FAILED\n");
                     }
                 }
                 else
                 {
                     PopMessage(true, "Failed to load Kernel32.dll.");
+                    if (flog) fprintf(flog, "Kernel32 not found\n");
                 }
 
                 VirtualFreeEx(hProcess, pDllPath, strlen(DllPath) + 1, MEM_RELEASE);
@@ -118,19 +142,23 @@ int main()
             else
             {
                 PopMessage(true, "Failed to inject dll.");
+                if (flog) fprintf(flog, "VirtualAllocEx FAILED\n");
             }
             CloseHandle(hProcess);
         }
         else
         {
             PopMessage(true, "OpenProcess failed.");
+            if (flog) fprintf(flog, "OpenProcess FAILED (error %lu)\n", GetLastError());
         }
     }
     else
     {
         PopMessage(true, "Failed to find \"Grim Dawn.exe\" process.");
+        if (flog) fprintf(flog, "Game process NOT FOUND\n");
     }
 
+    if (flog) fclose(flog);
     return 0;
 }
 

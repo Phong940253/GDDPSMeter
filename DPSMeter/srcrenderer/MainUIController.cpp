@@ -4,6 +4,7 @@
 #include "IPCMessage.h"
 #include "Logger.h"
 #include "resource.h"
+#include "DetourTeleport.h"
 
 //=============================================================================
 //=============================================================================
@@ -26,6 +27,7 @@ MainUIController::MainUIController()
   showDPSStats_ = false;
   showDetailDamage_ = false;
   showDispelWarning_ = false;
+  showTeleport_ = false;
 
   checkboxesRead_ = false;
   showOnceAtStartup_ = true;
@@ -301,6 +303,12 @@ void MainUIController::ShowWin(void* pd3dDevice)
       dispelBuffsWarning_.ShowWin(showDispelWarning_);
   }
 
+  if (showTeleport_)
+  {
+      teleportUI_.SetMoveUI(moveUI_);
+      teleportUI_.ShowWin(showTeleport_);
+  }
+
 }
 
 void MainUIController::Draw(const char* title, bool* p_open)
@@ -336,6 +344,7 @@ void MainUIController::Draw(const char* title, bool* p_open)
     ImGui::TableNextColumn(); ImGui::Checkbox("Show skill buff cooldowns", &showSkillCD_);
     ImGui::TableNextColumn(); ImGui::Checkbox("Show damage details win", &showDetailDamage_);
     ImGui::TableNextColumn(); ImGui::Checkbox("Show dispel buffs warning", &showDispelWarning_);
+    ImGui::TableNextColumn(); ImGui::Checkbox("Show teleport list", &showTeleport_);
     ImGui::EndTable();
 
   }
@@ -351,4 +360,9 @@ void MainUIController::Draw(const char* title, bool* p_open)
 void MainUIController::SetPathName(const std::string& path)
 {
   exePathName_ = path;
+}
+
+void MainUIController::SetTeleportDetour(DetourTeleport *teleport)
+{
+  teleportUI_.SetTeleportDetour(teleport);
 }

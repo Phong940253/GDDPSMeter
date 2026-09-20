@@ -12,6 +12,7 @@
 #include "IPCMessage.h"
 #include "CombatLog.h"
 #include "MainUIController.h"
+#include "DetourTeleport.h"
 #include "Texture.h"
 #include "Logger.h"
 
@@ -47,6 +48,9 @@ static MainUIController optionsWin;
 
 int IsCtrlKey(WPARAM key);
 static ImGuiKey ImGui_ImplWin32_VirtualKeyToImGuiKey(WPARAM wParam);
+// Fallback vkey->char (US layout) when ToUnicodeEx fails inside the LL hook
+// thread (its keyboard state is often stale). Shift via async state.
+static WCHAR MapVKeyToCharFallback(unsigned int vk);
 
 namespace OverlayWindow
 {
@@ -88,13 +92,9 @@ void Render()
 
         optionsWin.ShowWin(DirectX9Interface::pDevice);
 
-        // clear keys (prevents repeated inputs)
-        ImGuiIO& io = ImGui::GetIO();
-        for (int i = 0; i < IM_ARRAYSIZE(io.KeysData); i++)
-        {
-            ImGuiKeyData* key_data = &io.KeysData[i];
-            key_data->Down = 0;
-        }
+        // NOTE: do NOT wipe KeysData[].Down here. Key up/down state is fed
+        // by KeyboardHookProc (AddKeyEvent); clearing it every frame breaks
+        // held keys and InputText navigation/edit keys.
     }
 
 	 ImGui::EndFrame();
@@ -256,7 +256,7 @@ bool DirectXInit()
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.WantCaptureMouse = true; 
-    io.WantTextInput = false;
+    io.WantTextInput = true;  // enable text input for InputText widgets
     io.WantCaptureKeyboard = true;
     io.MouseDrawCursor = false;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
@@ -305,30 +305,32 @@ LRESULT WndKeyProcHandlerMod(HWND hwnd, WPARAM wParam, LPARAM lParam, bool mouse
     KBDLLHOOKSTRUCT* keyboardInfo = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
     unsigned int vkey = keyboardInfo->vkCode;
 
+    // Full key mapping so InputText nav/edit keys (Backspace, arrows, Enter...)
+    // work, not just text characters.
+    ImGuiKey imKey = ImGui_ImplWin32_VirtualKeyToImGuiKey(vkey);
+
     switch (wParam) {
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
-      //if (keyboardInfo->vkCode < 512)
-        //io.KeysDown[keyboardInfo->vkCode] = true;
       {
-      //LOGF("key down: %d\n", vkey);
-
-        if (IsCtrlKey(vkey))
+        if (imKey != ImGuiKey_None)
         {
-          ImGuiKey imKey = ImGui_ImplWin32_VirtualKeyToImGuiKey(vkey);
-          if (imKey == ImGuiKey_Escape)
-          {
-            LOGF("escape key hit\n");
-
-          }
-          io.AddKeyAnalogEvent(imKey, true, 0.0f);
-          if (vkey == VK_LSHIFT || vkey == VK_RSHIFT)
-          {
-            io.KeyShift = true;
-          }
+          io.AddKeyEvent(imKey, true);
+          io.SetKeyEventNativeData(imKey, (int)vkey, (int)keyboardInfo->scanCode);
         }
-        else
+        if (vkey == VK_LSHIFT || vkey == VK_RSHIFT) io.KeyShift = true;
+        if (vkey == VK_LCONTROL || vkey == VK_RCONTROL) io.KeyCtrl = true;
+        if (vkey == VK_LMENU || vkey == VK_RMENU) io.KeyAlt = true;
+        if (vkey == VK_LWIN || vkey == VK_RWIN) io.KeySuper = true;
+
+        // Text input only when no Ctrl/Alt held (those are shortcuts, not text)
+        bool ctrlHeld = (GetAsyncKeyState(VK_LCONTROL) & 0x8000) || (GetAsyncKeyState(VK_RCONTROL) & 0x8000);
+        bool altHeld = (GetAsyncKeyState(VK_LMENU) & 0x8000) || (GetAsyncKeyState(VK_RMENU) & 0x8000);
+        if (!ctrlHeld && !altHeld)
         {
+          static int charLogCount = 0;
+          int produced = 0;
+
           GetKeyState(keyboardInfo->vkCode);
           BYTE keys[256];
           if (GetKeyboardState(keys))
@@ -336,14 +338,43 @@ LRESULT WndKeyProcHandlerMod(HWND hwnd, WPARAM wParam, LPARAM lParam, bool mouse
             WCHAR keyPressed[10];
             HKL keyboardLayout = GetKeyboardLayout(NULL);
 
-            if (ToUnicodeEx(keyboardInfo->vkCode, keyboardInfo->scanCode, (BYTE*)keys, keyPressed, 10, 2, keyboardLayout))
+            int n = ToUnicodeEx(keyboardInfo->vkCode, keyboardInfo->scanCode, (BYTE*)keys, keyPressed, 10, 0, keyboardLayout);
+            if (n > 0)
             {
-              for (int i = 0; i < 10; i++)
+              for (int i = 0; i < n && i < 10; i++)
               {
                 if (keyPressed[i] > 0 && keyPressed[i] < 0x10000)
+                {
                   io.AddInputCharacterUTF16((unsigned short)keyPressed[i]);
+                  produced++;
+                  if (charLogCount < 80)
+                  {
+                    LOGF("KbChar: vk=%u ch=%d textin=%d\n", keyboardInfo->vkCode, (int)keyPressed[i], io.WantTextInput ? 1 : 0);
+                    charLogCount++;
+                  }
+                }
               }
+            }
+          }
 
+          // Fallback: hook-thread keyboard state is often stale so
+          // ToUnicodeEx may yield nothing - map common keys directly.
+          if (produced == 0)
+          {
+            WCHAR fb = MapVKeyToCharFallback(vkey);
+            if (fb)
+            {
+              io.AddInputCharacterUTF16((unsigned short)fb);
+              if (charLogCount < 80)
+              {
+                LOGF("KbCharFB: vk=%u ch=%d textin=%d\n", keyboardInfo->vkCode, (int)fb, io.WantTextInput ? 1 : 0);
+                charLogCount++;
+              }
+            }
+            else if (charLogCount < 80)
+            {
+              LOGF("KbMiss: vk=%u scan=%u textin=%d\n", keyboardInfo->vkCode, keyboardInfo->scanCode, io.WantTextInput ? 1 : 0);
+              charLogCount++;
             }
           }
         }
@@ -352,14 +383,16 @@ LRESULT WndKeyProcHandlerMod(HWND hwnd, WPARAM wParam, LPARAM lParam, bool mouse
       break;
     case WM_KEYUP:
     case WM_SYSKEYUP:
-      //if (keyboardInfo->vkCode < 512)
-      //  io.KeysDown[keyboardInfo->vkCode] = 0;
     {
-      if (vkey == VK_LSHIFT || vkey == VK_RSHIFT)
+      if (imKey != ImGuiKey_None)
       {
-        io.KeyShift = false;
+        io.AddKeyEvent(imKey, false);
+        io.SetKeyEventNativeData(imKey, (int)vkey, (int)keyboardInfo->scanCode);
       }
-
+      if (vkey == VK_LSHIFT || vkey == VK_RSHIFT) io.KeyShift = false;
+      if (vkey == VK_LCONTROL || vkey == VK_RCONTROL) io.KeyCtrl = false;
+      if (vkey == VK_LMENU || vkey == VK_RMENU) io.KeyAlt = false;
+      if (vkey == VK_LWIN || vkey == VK_RWIN) io.KeySuper = false;
     }
       break;
     }
@@ -432,13 +465,37 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam)
 
 LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
-    //LOGF("keyproc code=%d, w=%u, l=%u\n", nCode, wParam, lParam);
+    static int hookLogCount = 0;
+    static int totalKeys = 0;
     if (nCode != HC_ACTION)  // Nothing to do
         return CallNextHookEx(NULL, nCode, wParam, lParam);
 
+    totalKeys++;
+    if (hookLogCount < 5)
+    {
+        KBDLLHOOKSTRUCT* ki = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+        LOGF("KeyboardHookProc: nCode=%d w=%u vk=%u scan=%u\n", nCode, (unsigned)wParam, ki->vkCode, ki->scanCode);
+        hookLogCount++;
+    }
+    // Periodic alive ping (every 50 keys) so the log shows the hook is firing
+    if (totalKeys % 50 == 1 && ImGui::GetCurrentContext() != NULL)
+    {
+        LOGF("KeyboardHookProc alive: totalKeys=%d textin=%d\n",
+             totalKeys, ImGui::GetIO().WantTextInput ? 1 : 0);
+    }
+
     WndKeyProcHandlerMod(OverlayWindow::Hwnd, wParam, lParam, false);
 
-    return DefWindowProc(NULL, nCode, wParam, lParam);
+    // While typing in an ImGui text field (e.g. Add Location name),
+    // swallow the keystroke so it does NOT also drive the game.
+    if (ImGui::GetCurrentContext() != NULL)
+    {
+        ImGuiIO& io = ImGui::GetIO();
+        if (io.WantTextInput)
+            return 1;
+    }
+
+    return CallNextHookEx(NULL, nCode, wParam, lParam);
 }
 
 //#define OVERRIDE_MOUSE
@@ -589,6 +646,11 @@ void ImGuiMain::SetHwnWindow(void *hwnd)
     hwndGame = (HWND)hwnd;
 }
 
+void ImGuiMain::SetTeleportDetour(DetourTeleport *teleport)
+{
+    optionsWin.SetTeleportDetour(teleport);
+}
+
 //============================================================================
 //============================================================================
 void ImGuiMain::ImGuiStartup()
@@ -718,6 +780,37 @@ void ImGuiMain::ImGuiStartup()
 }
 
 // Map VK_xxx to ImGuiKey_xxx.
+// US-layout vkey -> char fallback for the LL hook thread.
+// Uses async shift state (works globally, no thread keyboard state needed).
+static WCHAR MapVKeyToCharFallback(unsigned int vk)
+{
+  bool shift = (GetAsyncKeyState(VK_LSHIFT) & 0x8000) || (GetAsyncKeyState(VK_RSHIFT) & 0x8000);
+
+  if (vk >= 'A' && vk <= 'Z')
+    return (WCHAR)(shift ? vk : (vk + 32));  // A-Z -> a-z / A-Z
+  if (vk >= '0' && vk <= '9')
+  {
+    static const char shifted[] = ")!@#$%^&*(";
+    return (WCHAR)(shift ? shifted[vk - '0'] : vk);
+  }
+  switch (vk)
+  {
+  case VK_SPACE: return L' ';
+  case VK_OEM_MINUS: return (WCHAR)(shift ? '_' : '-');
+  case VK_OEM_PLUS: return (WCHAR)(shift ? '+' : '=');
+  case VK_OEM_COMMA: return (WCHAR)(shift ? '<' : ',');
+  case VK_OEM_PERIOD: return (WCHAR)(shift ? '>' : '.');
+  case VK_OEM_1: return (WCHAR)(shift ? ':' : ';');
+  case VK_OEM_2: return (WCHAR)(shift ? '?' : '/');
+  case VK_OEM_3: return (WCHAR)(shift ? '~' : '`');
+  case VK_OEM_4: return (WCHAR)(shift ? '{' : '[');
+  case VK_OEM_5: return (WCHAR)(shift ? '|' : '\\');
+  case VK_OEM_6: return (WCHAR)(shift ? '}' : ']');
+  case VK_OEM_7: return (WCHAR)(shift ? '"' : '\'');
+  default: return 0;
+  }
+}
+
 int IsCtrlKey(WPARAM key)
 {
   switch (key)

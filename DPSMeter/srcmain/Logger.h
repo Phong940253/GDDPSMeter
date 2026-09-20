@@ -21,8 +21,8 @@ enum LogLevel
 #define LOGF(format, ...) Logger::Logf(format, ##__VA_ARGS__);
 #define DLOG(x, format, ...) Logger::LevelLog(x, format, ##__VA_ARGS__);
 #else
-#define LOGF(format, ...)
-#define DLOG(x, format, ...)
+#define LOGF(format, ...) Logger::Logf(format, ##__VA_ARGS__);
+#define DLOG(x, format, ...) Logger::LevelLog(x, format, ##__VA_ARGS__);
 #endif
 
 //#define SHOWDBG_LOG

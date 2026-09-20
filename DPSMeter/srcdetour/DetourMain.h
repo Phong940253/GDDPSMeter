@@ -12,6 +12,8 @@ class DetourCommon;
 class DetourSkill;
 class DetourOADAStats;
 class DetourScreen;
+class DetourTeleport;
+class DetourTerrainFix;
 
 //=============================================================================
 //=============================================================================
@@ -26,6 +28,7 @@ class DetourScreen;
 #define SYM_PLAYER_REGISTERCOMBATTEXTHIT "?RegisterCombatTextHit@Player@GAME@@UAEMM@Z"
 #define SYM_PLAYER_REGISTERCOMBATTEXTCRIT "?RegisterCombatTextCrit@Player@GAME@@UAEMM@Z"
 #define SYM_GAMEENGINE_REGISTERDAMAGE "?RegisterDamage@GameEngine@GAME@@QAEXIIM@Z"
+#define SYM_GAMEENGINE_ENABLEGAMEENGINE "?EnableGameEngine@GameEngine@GAME@@QAEXXZ"
 #define SYM_COMBATATTRIBACC_EXEDAMAGE "?ExecuteDamage@CombatAttributeAccumulator@GAME@@QAEXAAVCharacter@2@@Z"
 #define SYM_CTRLPLAYER_REQUESTMOVEACTION "?DefaultRequestMoveAction@ControllerPlayerState@GAME@@IAEX_N0ABVWorldVec3@2@@Z"
 #define SYM_PLAYER_POSTSPAWNPET "?PostPetSpawn@Player@GAME@@UAEXABVWorldVec3@2@III_N@Z"
@@ -152,6 +155,7 @@ public:
 
     static void __fastcall DTPlayerPostSpawnPet(void*, void*, unsigned int&, unsigned int, unsigned int, unsigned int, bool);
     static void __fastcall DTCharCharacterIsDying(void*);
+    static void __fastcall DTEnableGameEngine(void* This, void*);
 
 protected:
     void InitSubClasses();
@@ -186,6 +190,8 @@ private:
     DetourSkill *pDetourSkill_;
     DetourOADAStats *pDetourOADAStats_;
     DetourScreen *pDetourScreen_;
+    DetourTeleport *pDetourTeleport_;
+    DetourTerrainFix *pDetourTerrainFix_;
     std::vector<DetourBase*> subDetourClassList_;
 
     std::map<unsigned int, void*> skillMap_;
@@ -224,6 +230,8 @@ private:
 	static ThisFunc<void, void*, bool, bool, unsigned int&> fnCtrlPlayerStateDfltRequestMoveAction_;
 	static ThisFunc<void, void*, unsigned int&, unsigned int, unsigned int, unsigned int, bool> fnPlayerPostSpawnPet_;
 	static ThisFunc<void, void*> fnCharCharacterIsDying_;
+	static ThisFunc<void, void*> fnEnableGameEngine_;
+	void EnableGameEngine(void* This);
 };
 
 

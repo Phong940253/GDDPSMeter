@@ -9,6 +9,8 @@
 #include "DetourSkill.h"
 #include "DetourOADAStats.h"
 #include "DetourScreen.h"
+#include "DetourTeleport.h"
+#include "DetourTerrainFix.h"
 #include "IPCMessage.h"
 #include "DetourUtil.h"
 #include "AttribTypeDef.h"
@@ -44,6 +46,8 @@ DetourFnData datCtrlPlayerRequestMoveAction = { "game.dll", NULL, (VoidFn)&Detou
 DetourFnData datPlayerPostSpawnPet = { "game.dll", NULL, (VoidFn)&DetourMain::DTPlayerPostSpawnPet, SYM_PLAYER_POSTSPAWNPET };
 DetourFnData datCharCharacterIsDying = { "game.dll", NULL, (VoidFn)&DetourMain::DTCharCharacterIsDying, SYM_CHAR_CHARACTERISDYING };
 
+DetourFnData datEnableGameEngine = { "game.dll", NULL, (VoidFn)&DetourMain::DTEnableGameEngine, SYM_GAMEENGINE_ENABLEGAMEENGINE };
+
 ThisFunc<void, void*, void*> DetourMain::fnProcessMsgHwndWindow_;
 ThisFunc<struct HWND__*, void*> DetourMain::fnGetSystemWindow_;
 
@@ -62,6 +66,8 @@ ThisFunc<int*, void*, unsigned int &> DetourMain::fnCombatAttribAccuExeDamage_;
 ThisFunc<void, void*, bool, bool, unsigned int&> DetourMain::fnCtrlPlayerStateDfltRequestMoveAction_;
 ThisFunc<void, void*, unsigned int&, unsigned int, unsigned int, unsigned int, bool> DetourMain::fnPlayerPostSpawnPet_;
 ThisFunc<void, void*> DetourMain::fnCharCharacterIsDying_;
+
+ThisFunc<void, void*> DetourMain::fnEnableGameEngine_;
 
 DetourMain *DetourMain::sDetourMain_ = NULL;
 //=============================================================================
@@ -146,6 +152,18 @@ DetourMain::DetourMain()
     pDetourScreen_ = new DetourScreen();
     subDetourClassList_.push_back(pDetourScreen_);
     pDetourScreen_->SetParent(this);
+
+    pDetourTeleport_ = new DetourTeleport();
+    subDetourClassList_.push_back(pDetourTeleport_);
+    pDetourTeleport_->SetParent(this);
+
+    // Phase 1 guard: TerrainPatch::SetCoords null-this crash (coop rift).
+    // Runs via InitSubClasses()->SetupDetour(), non-fatal if symbols differ.
+    pDetourTerrainFix_ = new DetourTerrainFix();
+    subDetourClassList_.push_back(pDetourTerrainFix_);
+
+    // Connect teleport UI to the detour
+    ImGuiMain::SetTeleportDetour(pDetourTeleport_);
 }
 
 DetourMain::~DetourMain()
@@ -198,6 +216,9 @@ bool DetourMain::SetupDetour()
     fnPlayerPostSpawnPet_.SetFn(datPlayerPostSpawnPet.realFn_);
 
     status += HookDetour(datCharCharacterIsDying);
+
+    status += HookDetour(datEnableGameEngine);
+    fnEnableGameEngine_.SetFn(datEnableGameEngine.realFn_);
     fnCharCharacterIsDying_.SetFn(datCharCharacterIsDying.realFn_);
 
     if (status != 0)
@@ -368,6 +389,10 @@ void DetourMain::PreCharAttackTarget(void *charPtr, unsigned int a, unsigned int
         std::string defenderName = "defender";
         pDetourCommon_->GetObjectName(&entity, defenderName);
 
+        // Capture defender's record template for universal boss spawn
+        if (pDetourTeleport_)
+            pDetourTeleport_->CaptureTargetTemplate(&entity, defenderName.c_str());
+
         //fill
         memset(&playerAttackInProgress_, 0, sizeof(playerAttackInProgress_));
         playerAttackInProgress_.attackerIsPlayer_ = true;
@@ -447,6 +472,14 @@ void DetourMain::CombatgMgrApplyDamage(void *This, float a, unsigned int &playst
     {
         if (attackerId == playerId_ || attackerId == petId)
         {
+            // Capture victim template for universal boss spawn (any damage
+            // path: direct, DoT, pet, reflection - not just attack-start)
+            if (pDetourTeleport_ && ownerChar)
+            {
+                std::string vname = "victim";
+                pDetourCommon_->GetObjectName(ownerChar, vname);
+                pDetourTeleport_->CaptureTargetTemplate(ownerChar, vname.c_str());
+            }
             std::vector<unsigned int> newlist;
             DetourUtil::VectorMemoryToVector0<unsigned int>((unsigned int)&vlist, newlist);
             unsigned int skid = 0;
@@ -577,6 +610,33 @@ void DetourMain::CombatManagerTakeDamage(void* This, unsigned int& paramCombat, 
 
     DLOG(LogCombatMgr, "CombatManagerTakeDamage: owner=0x%p(%d), attackerId=%d\n",
         ownerChar, ownerId, attackerId);
+
+    // Same template capture as ApplyDamage (covers damage paths that skip it)
+    if (ownerChar && (attackerId == playerId_))
+    {
+        if (pDetourTeleport_)
+        {
+            std::string vname = "victim";
+            pDetourCommon_->GetObjectName(ownerChar, vname);
+            pDetourTeleport_->CaptureTargetTemplate(ownerChar, vname.c_str());
+        }
+    }
+    else if (ownerChar && attackerId != 0)
+    {
+        for (unsigned i = 0; i < petList_.size(); ++i)
+        {
+            if (petList_[i] == attackerId)
+            {
+                if (pDetourTeleport_)
+                {
+                    std::string vname = "victim";
+                    pDetourCommon_->GetObjectName(ownerChar, vname);
+                    pDetourTeleport_->CaptureTargetTemplate(ownerChar, vname.c_str());
+                }
+                break;
+            }
+        }
+    }
 }
 
 
@@ -899,6 +959,11 @@ void DetourMain::PlayerRegisterCombatTextCrit(void* This, float a, float f)
 
 void DetourMain::GameEngineRegisterDamage(void* This, unsigned int a, unsigned int b, float c)
 {
+    // Capture GameEngine* for teleport feature
+    if (This && pDetourTeleport_)
+    {
+        pDetourTeleport_->CaptureGameEngine(This);
+    }
     //this fn is a specific damage type registry
     //this fn is called by DTCombatgMgrApplyDamage, where the attacker id, skill id, and combatAttribTypes are known
     //however, this function gets called multiple times then some manager tallies all damages called into this fn 
@@ -1096,6 +1161,24 @@ void DetourMain::DTCharCharacterIsDying(void* This)
 {
     sDetourMain_->CharCharacterIsDying(This);
     fnCharCharacterIsDying_.Fn_(This);
+}
+
+//=============================================================================
+// EnableGameEngine - captures GameEngine* early
+//=============================================================================
+void DetourMain::EnableGameEngine(void* This)
+{
+    LOGF("EnableGameEngine: GameEngine=%p\n", This);
+    if (This && pDetourTeleport_)
+    {
+        pDetourTeleport_->CaptureGameEngine(This);
+    }
+}
+
+void DetourMain::DTEnableGameEngine(void* This, void*)
+{
+    sDetourMain_->EnableGameEngine(This);
+    fnEnableGameEngine_.Fn_(This);
 }
 
 

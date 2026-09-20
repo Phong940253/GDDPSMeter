@@ -47,6 +47,6 @@ set_target_properties(DPSMeter PROPERTIES OUTPUT_NAME "DPSMeter")
 set_target_properties(DPSMeter PROPERTIES LINK_FLAGS "/ignore:4099")
 set(LIBRARY_OUTPUT_PATH ${CMAKE_BINARY_DIR}/GDDPSMeterLoader)
 
-target_link_libraries(DPSMeter detours.lib winmm.lib d3dx9.lib dbghelp.lib)
+target_link_libraries(DPSMeter detours.lib winmm.lib dbghelp.lib)
 
 
