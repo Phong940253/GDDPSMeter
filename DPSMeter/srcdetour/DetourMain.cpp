@@ -10,7 +10,7 @@
 #include "DetourOADAStats.h"
 #include "DetourScreen.h"
 #include "DetourTeleport.h"
-#include "DetourTerrainFix.h"
+#include "DetourInputBlock.h"
 #include "IPCMessage.h"
 #include "DetourUtil.h"
 #include "AttribTypeDef.h"
@@ -156,11 +156,11 @@ DetourMain::DetourMain()
     pDetourTeleport_ = new DetourTeleport();
     subDetourClassList_.push_back(pDetourTeleport_);
     pDetourTeleport_->SetParent(this);
+    pDetourTeleport_->SetCommon(pDetourCommon_);
 
-    // Phase 1 guard: TerrainPatch::SetCoords null-this crash (coop rift).
-    // Runs via InitSubClasses()->SetupDetour(), non-fatal if symbols differ.
-    pDetourTerrainFix_ = new DetourTerrainFix();
-    subDetourClassList_.push_back(pDetourTerrainFix_);
+    // Block game-side (DirectInput) keyboard while typing in overlay fields.
+    pDetourInputBlock_ = new DetourInputBlock();
+    subDetourClassList_.push_back(pDetourInputBlock_);
 
     // Connect teleport UI to the detour
     ImGuiMain::SetTeleportDetour(pDetourTeleport_);
@@ -402,11 +402,25 @@ void DetourMain::PreCharAttackTarget(void *charPtr, unsigned int a, unsigned int
         playerAttackInProgress_.defender_ = defenderId;
         playerAttackInProgress_.totalDamage_ = 0.0f;
         snprintf(playerAttackInProgress_.name_, IPCNAME_SIZE - 1, "%s", defenderName.c_str());
+        // ID-first: item procs (Doom Bolt gloves) are NOT in skillMap_.
+        // Never force UI-name lookup here; resolve record safely or log id only.
+        const char *skname = "null";
         void *skillPtr = pDetourSkill_->GetSkillPtr(a);
-        const char *skname = pDetourCommon_->GetSkillName(skillPtr);
+        if (!skillPtr)
+        {
+            skillPtr = pDetourSkill_->GetItemSkillPtr(a);
+        }
+        if (skillPtr)
+        {
+            std::string rec;
+            if (pDetourCommon_->GetSkillRecord(skillPtr, rec))
+            {
+                skname = pDetourCommon_->GetSkillName(skillPtr);
+            }
+        }
 
         DLOG(LogCharAttack, "*PreCharAttackTarget %s this=0x%p id=%d, entity=0x%p id=%d, skid=%d(%X)(%s), b=%d c=%d, d=%d, e=%d\n",
-            (petId != 0) ? ":**pet" : ":", charPtr, id, &entity, defenderId, a, a, skname, b?1:0, c, d, e);
+            (petId != 0) ? ":**pet" : ":", charPtr, id, &entity, defenderId, a, a, skname ? skname : "null", b?1:0, c, d, e);
     }
     else
     {
@@ -414,10 +428,17 @@ void DetourMain::PreCharAttackTarget(void *charPtr, unsigned int a, unsigned int
         if (a)
         {
             void *skillPtr = pDetourSkill_->GetSkillPtr(a);
-            skname = pDetourCommon_->GetSkillName(skillPtr);
+            if (!skillPtr)
+            {
+                skillPtr = pDetourSkill_->GetItemSkillPtr(a);
+            }
+            if (skillPtr)
+            {
+                skname = pDetourCommon_->GetSkillName(skillPtr);
+            }
         }
 
-        DLOG(LogCharAttack, "enemy PreCharAttackTarget: skid=%d(%s)\n", a, skname);
+        DLOG(LogCharAttack, "enemy PreCharAttackTarget: skid=%d(%s)\n", a, skname ? skname : "null");
     }
 
 }
@@ -481,6 +502,7 @@ void DetourMain::CombatgMgrApplyDamage(void *This, float a, unsigned int &playst
                 pDetourTeleport_->CaptureTargetTemplate(ownerChar, vname.c_str());
             }
             std::vector<unsigned int> newlist;
+            // Hardened parser (MemValidity + caps); no __try here (vector in scope).
             DetourUtil::VectorMemoryToVector0<unsigned int>((unsigned int)&vlist, newlist);
             unsigned int skid = 0;
             unsigned int parentSkid = 0;
@@ -494,14 +516,22 @@ void DetourMain::CombatgMgrApplyDamage(void *This, float a, unsigned int &playst
                     break;
                 }
             }
-            void* devSkill = pDetourSkill_->GetDevSkillPtr(skid);
-            if (devSkill)
+            // ID-first: never force UI-name on unknown skid (item procs).
+            // Validate range to avoid garbage skid -> map miss -> safe fallback.
+            if (skid == 0 || skid == 0xffffffff)
             {
-                //DLOG(LogCombatMgr, "CombatgMgrApplyDamage: skillId=%d (%s)\n", skid);
-                const char* devSkname = pDetourCommon_->GetSkillName(devSkill);
+                skid = 0;
+            }
+            else
+            {
+                void* devSkill = pDetourSkill_->GetDevSkillPtr(skid);
+                if (devSkill)
+                {
+                    const char* devSkname = pDetourCommon_->GetSkillName(devSkill);
 
-                DLOG(LogCombatMgr, "CombatgMgrApplyDamage: owner=0x%p(%d), skid=%d(%s)\n  attackerId=%d, petId=%d, a=%1.1f, type=%d\n",
-                    ownerChar, ownerId, skid, devSkname, attackerId, petId, a, cmbtAttrType);
+                    DLOG(LogCombatMgr, "CombatgMgrApplyDamage: owner=0x%p(%d), skid=%d(%s)\n  attackerId=%d, petId=%d, a=%1.1f, type=%d\n",
+                        ownerChar, ownerId, skid, devSkname ? devSkname : "null", attackerId, petId, a, cmbtAttrType);
+                }
             }
 
             if (skid)
@@ -510,7 +540,8 @@ void DetourMain::CombatgMgrApplyDamage(void *This, float a, unsigned int &playst
 
                 if (skillPtr)
                 {
-                    const char* mainSkname = pDetourCommon_->GetSkillName(skillPtr);
+                    // Only resolve parent when skill is a known buff-tracked ptr.
+                    // GetParentSkillId itself is SEH-guarded (dual vtable risk).
                     unsigned int parentSkillId = pDetourSkill_->GetParentSkillId(skillPtr);
                     void* parentPtr = NULL;
                     if (parentSkillId)
@@ -520,8 +551,10 @@ void DetourMain::CombatgMgrApplyDamage(void *This, float a, unsigned int &playst
                         if (parentPtr && !devSkillPtr)
                         {
                             const char *sname = pDetourCommon_->GetSkillName(parentPtr);
-                            DLOG(LogCombatMgr, "   skname (%s), parent skname(%s)\n", mainSkname, sname);
-                            if (_strnicmp(sname, "Weapon", 6) != 0)
+                            const char* mainSkname = pDetourCommon_->GetSkillName(skillPtr);
+                            DLOG(LogCombatMgr, "   skname (%s), parent skname(%s)\n",
+                                mainSkname ? mainSkname : "null", sname ? sname : "null");
+                            if (sname && _strnicmp(sname, "Weapon", 6) != 0)
                             {
                                 skid = parentSkillId;
                             }
@@ -530,10 +563,16 @@ void DetourMain::CombatgMgrApplyDamage(void *This, float a, unsigned int &playst
                 }
                 else
                 {
+                    // Item proc path (Doom Bolt gloves): keep original skid,
+                    // re-validate via item map instead of re-hashing.
                     skillPtr = pDetourSkill_->GetItemSkillPtr(skid);
                     if (skillPtr)
                     {
-                        skid = pDetourCommon_->GetObjectId(skillPtr);
+                        unsigned int itemId = pDetourCommon_->GetObjectId(skillPtr);
+                        if (itemId != 0)
+                        {
+                            skid = itemId;
+                        }
                     }
                     else
                     {

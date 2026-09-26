@@ -13,6 +13,7 @@
 #include "CombatLog.h"
 #include "MainUIController.h"
 #include "DetourTeleport.h"
+#include "DetourInputBlock.h"
 #include "Texture.h"
 #include "Logger.h"
 
@@ -32,6 +33,9 @@ int ScreenTop = NULL;
 int ScreenBottom = NULL;
 bool running = true;
 ImFont* font = NULL;
+// Last tick the LL keyboard hook delivered a key (same overlay thread).
+// The poll-feed below takes over when the hook goes silent.
+DWORD g_hookLastTick = 0;
 
 //#define USE_NOTEPAD
 #ifdef USE_NOTEPAD
@@ -86,6 +90,20 @@ void Render()
     ImGui_ImplWin32_NewFrame();
 
     ImGui::NewFrame();
+
+    // Overlay window is click-through by design (WS_EX_TRANSPARENT): the game
+    // keeps OS focus, so the backend's WM_KILLFOCUS -> AddFocusEvent(false)
+    // would set AppAcceptingEvents=false forever, silently dropping EVERY
+    // hook-fed key/char event (mouse works only because it is written
+    // directly). Force-accept: game-side blocking is handled separately via
+    // DetourInputBlock while typing.
+    ImGui::GetIO().SetAppAcceptingEvents(true);
+
+    // While typing in an overlay field, block the game's own (DirectInput)
+    // keyboard polling so keystrokes don't also drive the character.
+    DetourInputBlock::SetBlockGameKeyboard(
+        menuShow && ImGui::GetIO().WantTextInput);
+
     if (menuShow)
     {
         InputHandler();
@@ -124,11 +142,53 @@ void Render()
 
 //============================================================================
 //============================================================================
+static LRESULT CALLBACK GameWndSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+static WNDPROC s_gameWndOrig = NULL;
+
 void MainLoop()
 {
     static RECT OldRect;
     ZeroMemory(&DirectX9Interface::Message, sizeof(MSG));
     LOGF("---main loop start");
+    {
+        // Identity: render-side context + DPSMeter instance count.
+        // Must match the hook-side ctx/dll or feed and render are split.
+        HMODULE hSelf = NULL;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)&MainLoop, &hSelf);
+        int dpsCount = 0;
+        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+        if (hSnap != INVALID_HANDLE_VALUE)
+        {
+            MODULEENTRY32 me;
+            me.dwSize = sizeof(me);
+            if (Module32First(hSnap, &me))
+            {
+                do {
+                    if (_stricmp(me.szModule, "DPSMeter.dll") == 0)
+                        dpsCount++;
+                } while (Module32Next(hSnap, &me));
+            }
+            CloseHandle(hSnap);
+        }
+        LOGF("MainLoop: ctx=%p dll=%p dpsmeter_instances=%d\n",
+             ImGui::GetCurrentContext(), hSelf, dpsCount);
+    }
+    // Subclass the game window: while typing in an overlay field, swallow
+    // key/char messages (shortcuts, chat) before the game sees them. The LL
+    // hook is unreliable (Windows may silently drop it); subclassing is
+    // synchronous and in-process. Polling APIs are covered by DetourInputBlock.
+    if (_HWND && !s_gameWndOrig)
+    {
+        s_gameWndOrig = (WNDPROC)SetWindowLongPtrA(
+            _HWND, GWLP_WNDPROC, (LONG_PTR)GameWndSubclassProc);
+        char cls[64] = { 0 }, ttl[128] = { 0 };
+        GetClassNameA(_HWND, cls, sizeof(cls) - 1);
+        GetWindowTextA(_HWND, ttl, sizeof(ttl) - 1);
+        LOGF("MainLoop: game wnd subclass %s orig=%p hwnd=%p class='%s' title='%s'\n",
+             s_gameWndOrig ? "OK" : "FAILED", s_gameWndOrig, _HWND, cls, ttl);
+    }
 
     while (running && DirectX9Interface::Message.message != WM_QUIT) 
     {
@@ -175,16 +235,118 @@ void MainLoop()
 		io.MousePos.x = (float)(TempPoint2.x - TempPoint.x);
 		io.MousePos.y = (float)(TempPoint2.y - TempPoint.y);
 
-		if (GetAsyncKeyState(0x1)) 
+		static bool mouseWasDown = false;
+		static int clickLogCount = 0;
+		if (GetAsyncKeyState(0x1))
 		{
 			io.MouseDown[0] = true;
-			io.MouseClicked[0] = true;
-			//io.MouseClickedPos[0].x = io.MousePos.x;
-			//io.MouseClickedPos[0].x = io.MousePos.y;
+			// NOTE: do NOT write io.MouseClicked here - ImGui core derives
+			// it in NewFrame from the MouseDown edge. Forcing it every frame
+			// corrupts click detection (stuck-clicked / missed edges).
+			if (!mouseWasDown && clickLogCount < 5)
+			{
+				LOGF("OverlayClick: pos=(%.0f,%.0f)\n", io.MousePos.x, io.MousePos.y);
+				clickLogCount++;
+			}
+			mouseWasDown = true;
 		}
-		else 
+		else
 		{
 			io.MouseDown[0] = false;
+			mouseWasDown = false;
+		}
+
+		// Poll-feed failover: if the LL keyboard hook goes silent (no key
+		// event for >3s), feed key transitions ourselves from async state so
+		// typing still works. Same ImGui context, same thread (MainLoop).
+		{
+			static const unsigned char polledKeys[] = {
+				'A','B','C','D','E','F','G','H','I','J','K','L','M',
+				'N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
+				'0','1','2','3','4','5','6','7','8','9',
+				VK_SPACE, VK_BACK, VK_RETURN, VK_ESCAPE, VK_TAB, VK_DELETE,
+				VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN, VK_HOME, VK_END,
+				VK_OEM_MINUS, VK_OEM_PLUS, VK_OEM_COMMA, VK_OEM_PERIOD,
+				VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5,
+				VK_OEM_6, VK_OEM_7
+			};
+			static bool pDown[256] = { false };
+			static DWORD pHoldTick[256] = { 0 };
+			static DWORD pRepeatTick[256] = { 0 };
+			static bool announced = false;
+			DWORD now = timeGetTime();
+			bool hookAlive = (now - g_hookLastTick < 3000);
+			if (!hookAlive && !announced)
+			{
+				LOGF("PollFeed: LL hook silent, feeding keys by poll\n");
+				announced = true;
+			}
+			if (menuShow && !hookAlive)
+			{
+				bool ctrlHeld = (GetAsyncKeyState(VK_LCONTROL) & 0x8000) ||
+				                (GetAsyncKeyState(VK_RCONTROL) & 0x8000);
+				bool altHeld = (GetAsyncKeyState(VK_LMENU) & 0x8000) ||
+				               (GetAsyncKeyState(VK_RMENU) & 0x8000);
+				for (unsigned i = 0; i < sizeof(polledKeys); ++i)
+				{
+					unsigned vk = polledKeys[i];
+					bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+					if (down && !pDown[vk])
+					{
+						pDown[vk] = true;
+						pHoldTick[vk] = now;
+						pRepeatTick[vk] = now;
+						ImGuiKey ik = ImGui_ImplWin32_VirtualKeyToImGuiKey(vk);
+						if (ik != ImGuiKey_None)
+						{
+							io.AddKeyEvent(ik, true);
+							io.SetKeyEventNativeData(ik, (int)vk, 0);
+						}
+						if (!ctrlHeld && !altHeld)
+						{
+							WCHAR fb = MapVKeyToCharFallback(vk);
+							if (fb)
+								io.AddInputCharacterUTF16((unsigned short)fb);
+						}
+					}
+					else if (!down && pDown[vk])
+					{
+						pDown[vk] = false;
+						ImGuiKey ik = ImGui_ImplWin32_VirtualKeyToImGuiKey(vk);
+						if (ik != ImGuiKey_None)
+						{
+							io.AddKeyEvent(ik, false);
+							io.SetKeyEventNativeData(ik, (int)vk, 0);
+						}
+					}
+					else if (down && pDown[vk] && io.WantTextInput &&
+					         now - pHoldTick[vk] > 500 && now - pRepeatTick[vk] > 80)
+					{
+						// Held-key repeat for text (backspace delete etc.)
+						pRepeatTick[vk] = now;
+						if (!ctrlHeld && !altHeld)
+						{
+							WCHAR fb = MapVKeyToCharFallback(vk);
+							if (fb)
+								io.AddInputCharacterUTF16((unsigned short)fb);
+						}
+					}
+				}
+			}
+			else if (hookAlive)
+			{
+				// Hook alive: track shadows only so edges stay in sync.
+				for (unsigned i = 0; i < sizeof(polledKeys); ++i)
+				{
+					unsigned vk = polledKeys[i];
+					bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+					pDown[vk] = down;
+					if (down && pHoldTick[vk] == 0)
+						pHoldTick[vk] = now;
+					if (!down)
+						pHoldTick[vk] = 0;
+				}
+			}
 		}
 
 		if (TempRect.left != OldRect.left || TempRect.right != OldRect.right || TempRect.top != OldRect.top || TempRect.bottom != OldRect.bottom) 
@@ -219,6 +381,11 @@ void MainLoop()
 
 	DestroyWindow(OverlayWindow::Hwnd);
 	UnregisterClass(OverlayWindow::WindowClass.lpszClassName, OverlayWindow::WindowClass.hInstance);
+	if (_HWND && s_gameWndOrig)
+	{
+		SetWindowLongPtrA(_HWND, GWLP_WNDPROC, (LONG_PTR)s_gameWndOrig);
+		s_gameWndOrig = NULL;
+	}
 }
 
 //============================================================================
@@ -302,6 +469,21 @@ LRESULT WndKeyProcHandlerMod(HWND hwnd, WPARAM wParam, LPARAM lParam, bool mouse
 
   if (!mouse)
   {
+    // Overlay is click-through by design (game keeps OS focus): a prior
+    // WM_KILLFOCUS may have cleared AppAcceptingEvents, which silently drops
+    // EVERY fed key/char event. Force-accept here at feed time (Render also
+    // sets it per frame).
+    if (!io.AppAcceptingEvents)
+    {
+        static int acceptLog = 0;
+        if (acceptLog < 3)
+        {
+            LOGF("FeedBlocked: AppAcceptingEvents was false, forcing true\n");
+            acceptLog++;
+        }
+        io.SetAppAcceptingEvents(true);
+    }
+
     KBDLLHOOKSTRUCT* keyboardInfo = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
     unsigned int vkey = keyboardInfo->vkCode;
 
@@ -471,10 +653,20 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam)
         return CallNextHookEx(NULL, nCode, wParam, lParam);
 
     totalKeys++;
+    // Heartbeat for the poll-feed failover below (same thread).
+    g_hookLastTick = timeGetTime();
     if (hookLogCount < 5)
     {
         KBDLLHOOKSTRUCT* ki = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
-        LOGF("KeyboardHookProc: nCode=%d w=%u vk=%u scan=%u\n", nCode, (unsigned)wParam, ki->vkCode, ki->scanCode);
+        // ctx + module identity: proves feed and render share one ImGui
+        // context and a single DPSMeter instance.
+        HMODULE hSelf = NULL;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)&KeyboardHookProc, &hSelf);
+        LOGF("KeyboardHookProc: nCode=%d w=%u vk=%u scan=%u ctx=%p dll=%p\n",
+             nCode, (unsigned)wParam, ki->vkCode, ki->scanCode,
+             ImGui::GetCurrentContext(), hSelf);
         hookLogCount++;
     }
     // Periodic alive ping (every 50 keys) so the log shows the hook is firing
@@ -501,6 +693,35 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam)
 //#define OVERRIDE_MOUSE
 
 HHOOK mhook, khook;
+// Game window subclass (message-path block while typing); s_gameWndOrig is
+// defined before MainLoop.
+static LRESULT CALLBACK GameWndSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    if (DetourInputBlock::WantsBlock())
+    {
+        switch (msg)
+        {
+        case WM_KEYDOWN:
+        case WM_SYSKEYDOWN:
+        case WM_CHAR:
+        case WM_SYSCHAR:
+        case WM_DEADCHAR:
+        case WM_SYSDEADCHAR:
+        case WM_UNICHAR:
+        case WM_INPUT:
+        {
+            static LONG swallowed = 0;
+            LONG n = InterlockedIncrement(&swallowed);
+            if (n <= 5 || n % 100 == 0)
+                LOGF("GameWnd: swallowed msg=%u vk=%u total=%d\n", msg, (unsigned)wParam, n);
+            return 0; // swallow: game never sees the keystroke
+        }
+        default:
+            break;
+        }
+    }
+    return CallWindowProcA(s_gameWndOrig, hWnd, msg, wParam, lParam);
+}
 //============================================================================
  //============================================================================
 void HookMouse()
@@ -513,11 +734,11 @@ void HookMouse()
   khook = SetWindowsHookExA(WH_KEYBOARD_LL, KeyboardHookProc, NULL, 0); //hook keyboard
   if (!khook)
   {
-    //LOGF("  err=0x%X\n", GetLastError());
+    LOGF("HookMouse: keyboard hook FAILED err=%u\n", GetLastError());
   }
   else
   {
-    //LOGF("  set\n");
+    LOGF("HookMouse: keyboard hook installed=%p\n", khook);
   }
 }
 #endif

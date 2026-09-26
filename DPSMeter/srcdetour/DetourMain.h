@@ -13,7 +13,7 @@ class DetourSkill;
 class DetourOADAStats;
 class DetourScreen;
 class DetourTeleport;
-class DetourTerrainFix;
+class DetourInputBlock;
 
 //=============================================================================
 //=============================================================================
@@ -191,7 +191,7 @@ private:
     DetourOADAStats *pDetourOADAStats_;
     DetourScreen *pDetourScreen_;
     DetourTeleport *pDetourTeleport_;
-    DetourTerrainFix *pDetourTerrainFix_;
+    DetourInputBlock *pDetourInputBlock_;
     std::vector<DetourBase*> subDetourClassList_;
 
     std::map<unsigned int, void*> skillMap_;

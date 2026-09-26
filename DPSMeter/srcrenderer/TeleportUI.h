@@ -22,4 +22,7 @@ private:
     int selectedIndex_;
     int spawnCat_;
     char inputName_[128];
+    char spawnSearch_[128];
+    bool spawnSearchFocus_;  // set by F3 hotkey, consumed by InputText
+    bool spawnSearchWasActive_;
 };

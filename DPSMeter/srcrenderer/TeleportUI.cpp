@@ -1,9 +1,31 @@
 #include <windows.h>
 #include <mmsystem.h>
+#include <ctype.h>
 #include "MainImgui.h"
 #include "TeleportUI.h"
 #include "DetourTeleport.h"
 #include "Logger.h"
+
+// Case-insensitive substring match on target name (empty query matches all).
+static bool SpawnNameMatch(const SpawnTarget &t, const char *query)
+{
+    if (!query || query[0] == '\0')
+        return true;
+    const char *name = t.name;
+    for (const char *s = name; *s; ++s)
+    {
+        const char *a = s;
+        const char *b = query;
+        while (*a && *b && tolower((unsigned char)*a) == tolower((unsigned char)*b))
+        {
+            ++a;
+            ++b;
+        }
+        if (*b == '\0')
+            return true;
+    }
+    return false;
+}
 
 //=============================================================================
 //=============================================================================
@@ -13,6 +35,9 @@ TeleportUI::TeleportUI()
     selectedIndex_ = -1;
     spawnCat_ = 0;
     memset(inputName_, 0, sizeof(inputName_));
+    memset(spawnSearch_, 0, sizeof(spawnSearch_));
+    spawnSearchFocus_ = false;
+    spawnSearchWasActive_ = false;
 }
 
 void TeleportUI::ShowWin(bool &showWindow)
@@ -308,16 +333,38 @@ void TeleportUI::Draw(const char* title, bool* p_open)
                 ImGui::SameLine();
                 int shown = 0;
                 for (int i = 0; i < tcount; ++i)
-                    if (spawnCat_ == 0 || strcmp(tgts[i].cat, cats[spawnCat_]) == 0)
+                    if ((spawnCat_ == 0 || strcmp(tgts[i].cat, cats[spawnCat_]) == 0) &&
+                        SpawnNameMatch(tgts[i], spawnSearch_))
                         shown++;
                 char cap[64];
                 sprintf_s(cap, "(%d)", shown);
                 ImGui::Text("%s", cap);
 
+                // Text search (F3 focuses without needing the mouse; Esc
+                // releases. Keys are blocked from the game while typing).
+                if (ImGui::IsKeyPressed(ImGuiKey_F3))
+                    spawnSearchFocus_ = true;
+                if (spawnSearchFocus_)
+                {
+                    ImGui::SetKeyboardFocusHere();
+                    spawnSearchFocus_ = false;
+                }
+                ImGui::PushItemWidth(-1);
+                ImGui::InputTextWithHint("##spawnsearch", "Search name... (F3)", spawnSearch_, sizeof(spawnSearch_));
+                bool searchActive = ImGui::IsItemActive();
+                if (searchActive != spawnSearchWasActive_)
+                {
+                    LOGF("SpawnSearch: active=%d text='%s'\n", searchActive ? 1 : 0, spawnSearch_);
+                    spawnSearchWasActive_ = searchActive;
+                }
+                ImGui::PopItemWidth();
+
                 ImGui::BeginChild("SpawnList", ImVec2(320, 140), true);
                 for (int i = 0; i < tcount; ++i)
                 {
                     if (spawnCat_ != 0 && strcmp(tgts[i].cat, cats[spawnCat_]) != 0)
+                        continue;
+                    if (!SpawnNameMatch(tgts[i], spawnSearch_))
                         continue;
                     char label[192];
                     if (tgts[i].level > 0)

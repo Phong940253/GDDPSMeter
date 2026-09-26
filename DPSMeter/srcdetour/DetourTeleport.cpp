@@ -6,6 +6,7 @@
 
 #include "DetourTeleport.h"
 #include "DetourMain.h"
+#include "DetourCommon.h"
 #include "DetourUtil.h"
 #include "Logger.h"
 
@@ -147,6 +148,7 @@ DetourTeleport::DetourTeleport()
     playerPtr_ = NULL;
     gameEnginePtr_ = NULL;
     sDetourMain_ = NULL;
+    pCommon_ = NULL;
     memset(history_, 0, sizeof(history_));
     memset(savedLocations_, 0, sizeof(savedLocations_));
     memset(lastWorldCoords_, 0, sizeof(lastWorldCoords_));
@@ -941,12 +943,18 @@ void DetourTeleport::CaptureTargetTemplate(void *entity, const char *displayName
         __try { level = fnGetCharLevel_.Fn_(entity); }
         __except (EXCEPTION_EXECUTE_HANDLER) { level = 0; }
     }
-    AddSpawnTarget(displayName ? displayName : "unknown", found, level);
+    // Prefer the proper display name ("Mogara, the Prime Matriarch") over
+    // the record-derived id ("manticore_jaggedwaste_01").
+    char pretty[128] = { 0 };
+    const char *finalName = displayName;
+    if (pCommon_ && pCommon_->GetEntityDisplayName(entity, pretty, sizeof(pretty)) && pretty[0])
+        finalName = pretty;
+    AddSpawnTarget(finalName ? finalName : "unknown", found, level);
     if (templateLogCount_ < 40)
     {
         LOGF("DetourTeleport: target template [%d] lv=%u %s = %s\n",
              templateLogCount_, level,
-             displayName ? displayName : "?", lastTemplate_);
+             finalName ? finalName : "?", lastTemplate_);
         templateLogCount_++;
     }
 }
@@ -967,17 +975,48 @@ static const char *GetTargetsFilePath()
     return path;
 }
 
+// Built-in roster seeds: bosses the user wants without fighting them first.
+// Shared by SeedBuiltins (add/rename) and AddSpawnTarget (canonical name
+// wins over live-captured display names so farming never renames them back).
+struct BuiltinSeed { const char *name; const char *path; const char *cat; };
+static const BuiltinSeed kBuiltinSeeds[] = {
+    { "Mogara, the Prime Matriarch",
+      "records/creatures/enemies/boss&quest/manticore_jaggedwaste_01.dbr",
+      "Bounty" },
+    { "Flarnok ~ Infernal",
+      "records/creatures/enemies/hero/korvaakservant_h05.dbr",
+      "Hero" },
+    { "Hrohn Everkeep",
+      "records/creatures/enemies/boss&quest/wight_iceboundpassage_01.dbr",
+      "BossQuest" },
+};
+static const char *BuiltinNameForPath(const char *path)
+{
+    if (!path)
+        return NULL;
+    for (int i = 0; i < sizeof(kBuiltinSeeds) / sizeof(kBuiltinSeeds[0]); ++i)
+    {
+        if (strcmp(kBuiltinSeeds[i].path, path) == 0)
+            return kBuiltinSeeds[i].name;
+    }
+    return NULL;
+}
+
 void DetourTeleport::AddSpawnTarget(const char *name, const char *path, unsigned int level)
 {
+    // Built-in canonical names win over live-captured display names so a
+    // seed (e.g. Mogara) is never renamed back by farming captures.
+    const char *canonical = path ? BuiltinNameForPath(path) : NULL;
+    const char *wantName = (canonical && canonical[0]) ? canonical : name;
     // Dedup by path
     for (int i = 0; i < spawnTargetCount_; ++i)
     {
         if (strcmp(spawnTargets_[i].path, path) == 0)
         {
             bool changed = false;
-            if (name && strcmp(spawnTargets_[i].name, name) != 0)
+            if (wantName && strcmp(spawnTargets_[i].name, wantName) != 0)
             {
-                strncpy_s(spawnTargets_[i].name, name, sizeof(spawnTargets_[i].name) - 1);
+                strncpy_s(spawnTargets_[i].name, wantName, sizeof(spawnTargets_[i].name) - 1);
                 changed = true;
             }
             if (spawnTargets_[i].level != level)
@@ -1021,8 +1060,8 @@ void DetourTeleport::LoadTargets()
 {
     FILE *f = NULL;
     fopen_s(&f, GetTargetsFilePath(), "r");
-    if (!f)
-        return;
+    if (f)
+    {
     char line[512];
     while (fgets(line, sizeof(line), f) && spawnTargetCount_ < MAX_SPAWN_TARGETS)
     {
@@ -1057,6 +1096,58 @@ void DetourTeleport::LoadTargets()
     }
     fclose(f);
     LOGF("DetourTeleport: Loaded %d spawn targets\n", spawnTargetCount_);
+    }
+    SeedBuiltins();
+}
+
+// Built-in seeds: bosses the user wants without fighting them first.
+// AddSpawnTarget dedups by path, so re-seeding is safe.
+void DetourTeleport::SeedBuiltins()
+{
+    LOGF("DetourTeleport: SeedBuiltins begin count=%d file=%s\n",
+         spawnTargetCount_, GetTargetsFilePath());
+    for (int i = 0; i < sizeof(kBuiltinSeeds) / sizeof(kBuiltinSeeds[0]); ++i)
+    {
+        int idx = -1;
+        for (int k = 0; k < spawnTargetCount_; ++k)
+        {
+            if (strcmp(spawnTargets_[k].path, kBuiltinSeeds[i].path) == 0)
+            {
+                idx = k;
+                break;
+            }
+        }
+        if (idx < 0)
+        {
+            if (spawnTargetCount_ >= MAX_SPAWN_TARGETS)
+            {
+                LOGF("DetourTeleport: seed '%s' skipped (roster full)\n", kBuiltinSeeds[i].name);
+                continue;
+            }
+            AddSpawnTarget(kBuiltinSeeds[i].name, kBuiltinSeeds[i].path, 0);
+            // Tag the category (AddSpawnTarget defaults to Captured) and
+            // re-save so the file matches memory.
+            strncpy_s(spawnTargets_[spawnTargetCount_ - 1].cat,
+                      kBuiltinSeeds[i].cat, sizeof(spawnTargets_[0].cat) - 1);
+            SaveTargets();
+            LOGF("DetourTeleport: seeded builtin '%s'\n", kBuiltinSeeds[i].name);
+        }
+        else if (strcmp(spawnTargets_[idx].name, kBuiltinSeeds[i].name) != 0)
+        {
+            // Path already captured under another display name (e.g. from
+            // fighting the boss) - adopt the canonical name so search finds it.
+            LOGF("DetourTeleport: renamed builtin '%s' -> '%s'\n",
+                 spawnTargets_[idx].name, kBuiltinSeeds[i].name);
+            strncpy_s(spawnTargets_[idx].name,
+                      kBuiltinSeeds[i].name, sizeof(spawnTargets_[idx].name) - 1);
+            SaveTargets();
+        }
+        else
+        {
+            LOGF("DetourTeleport: builtin '%s' already present\n", kBuiltinSeeds[i].name);
+        }
+    }
+    LOGF("DetourTeleport: SeedBuiltins done count=%d\n", spawnTargetCount_);
 }
 
 const char *DetourTeleport::ActiveSpawnPath() const

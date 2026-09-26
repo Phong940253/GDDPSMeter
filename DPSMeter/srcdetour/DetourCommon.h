@@ -25,6 +25,13 @@
 #define SYM_SKILL_GETCOOLDOWNTOTAL "?GetCooldownTotal@Skill@GAME@@QBEHXZ" 
 #define SYM_GETGAMETIME "?GetGameTime@GAME@@YAHXZ"
 #define SYM_CHAR_GETPORTRAITNAME "?GetPortraitName@Character@GAME@@QBEABV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@XZ" 
+// Display name via description tag + localization (x64 first, x86 fallback).
+#define SYM_ACTOR_GETDESCRIPTIONTAG_X64 "?GetDescriptionTag@Actor@GAME@@QEBAPEBDXZ"
+#define SYM_ACTOR_GETDESCRIPTIONTAG_X86 "?GetDescriptionTag@Actor@GAME@@QBEPBDXZ"
+#define SYM_LOCMGR_INSTANCE_X64 "?Instance@LocalizationManager@GAME@@SAAEAV12@XZ"
+#define SYM_LOCMGR_INSTANCE_X86 "?Instance@LocalizationManager@GAME@@SAAAV12@XZ"
+#define SYM_LOCMGR_LOCALIZE_X64 "?Localize@LocalizationManager@GAME@@QEAAPEBGPEBDZZ"
+#define SYM_LOCMGR_LOCALIZE_X86 "?Localize@LocalizationManager@GAME@@QAAPBGPBDZZ"
 
 //=============================================================================
 //=============================================================================
@@ -46,6 +53,10 @@ public:
   unsigned int GetObjectId(void* obj) const;
   void GetObjectName(void*, std::string &name);
   const char* GetSkillName(void* skillptr);
+  // SEH-safe wrapper: never crashes, returns false on bad ptr.
+  // Prefers record path (GetObjectName) over UI name for item procs.
+  bool GetSkillRecord(void* skillptr, std::string &record) const;
+  const char* GetSafeSkillName(void* skillptr);
   std::vector<unsigned int*>& CharGetSkillList(void *charPtr) const;
   std::vector<unsigned int*>& SkillMgrGetItemSkillList(void *charPtr) const;
   unsigned int& CharGetSkillMgr(void *charPtr) const;
@@ -62,6 +73,10 @@ public:
   int SkillGetCooldownTotal(void*) const;
   int GetGameTime() const;
   unsigned int& CharGetPortraitName(void* charPtr) const;
+  // Proper display name ("Mogara, the Prime Matriarch") via the actor's
+  // description tag + localization. False when unavailable (caller falls
+  // back to the record-derived name).
+  bool GetEntityDisplayName(void* entity, char* out, int outSize) const;
 
 private:
   bool initialized_;
@@ -86,6 +101,9 @@ private:
   ThisFunc<int, void*> fnSkillGetCooldownTotal_;
   ThisFunc<void*, void*> fnSkillGetManager_;
   ThisFunc<unsigned int&, void*> fnCharGetPortraitName_;
+  ThisFunc<char const*, void*> fnActorGetDescriptionTag_;
+  CdeclFunc<void*> fnLocMgrInstance_;
+  ThisFunc<const wchar_t*, void*, const char*> fnLocMgrLocalize_;
 
   FnGenerateUISkillInfo fnGenerateUISkillInfo_;
   FnGetGameTime fnGetGameTime_;

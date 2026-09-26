@@ -27,8 +27,59 @@ DetourFnData datSkillGetCooldownTime = { "game.dll", NULL, NULL, SYM_SKILL_GETCO
 DetourFnData datSkillGetCooldownTotal = { "game.dll", NULL, NULL, SYM_SKILL_GETCOOLDOWNTOTAL };
 DetourFnData datGetGameTime = { "engine.dll", NULL, NULL, SYM_GETGAMETIME };
 DetourFnData datCharGetPortraitName = { "game.dll", NULL, NULL, SYM_CHAR_GETPORTRAITNAME };
+DetourFnData datActorGetDescriptionTag = { "engine.dll", NULL, NULL, SYM_ACTOR_GETDESCRIPTIONTAG_X64 };
+DetourFnData datLocMgrInstance = { "engine.dll", NULL, NULL, SYM_LOCMGR_INSTANCE_X64 };
+DetourFnData datLocMgrLocalize = { "engine.dll", NULL, NULL, SYM_LOCMGR_LOCALIZE_X64 };
 
 //=============================================================================
+// SEH helpers: POD-only, no C++ objects -> __try legal (C2712).
+// All game.dll/engine.dll calls go through these; methods below only
+// validate + interpret results, so callers with maps/strings need no __try.
+//=============================================================================
+namespace
+{
+typedef unsigned int (__thiscall *RawObjIdFn)(void*);
+typedef const char* (__thiscall *RawObjNameFn)(void*);
+typedef void (__cdecl *RawSkillInfoFn)(void*, unsigned int&);
+typedef int (__thiscall *RawCooldownFn)(void*);
+typedef void* (__thiscall *RawMgrFn)(void*);
+
+unsigned int SEH_CallObjId(RawObjIdFn fn, void* obj)
+{
+    if (!fn || !obj) return 0;
+    __try { return fn(obj); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+const char* SEH_CallObjName(RawObjNameFn fn, void* obj)
+{
+    if (!fn || !obj) return 0;
+    __try { return fn(obj); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+bool SEH_CallSkillInfo(RawSkillInfoFn fn, void* skill, unsigned int& out)
+{
+    if (!fn || !skill) return false;
+    __try { fn(skill, out); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+int SEH_CallCooldown(RawCooldownFn fn, void* skill)
+{
+    if (!fn || !skill) return 0;
+    __try { return fn(skill); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+void* SEH_CallMgr(RawMgrFn fn, void* obj)
+{
+    if (!fn || !obj) return 0;
+    __try { return fn(obj); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+} // namespace
+
 //=============================================================================
 DetourCommon::DetourCommon()
 {
@@ -94,6 +145,36 @@ bool DetourCommon::SetupDetour()
 	status += HookDetour(datGetGameTime);
     fnGetGameTime_ = (FnGetGameTime)datGetGameTime.realFn_;
 
+    // Display-name chain (call-only, x64 first then x86). Not folded into
+    // status: silently unavailable on unmatched versions.
+    HookDetour(datActorGetDescriptionTag);
+    if (datActorGetDescriptionTag.realFn_ == NULL)
+    {
+        datActorGetDescriptionTag.mangleName_ = SYM_ACTOR_GETDESCRIPTIONTAG_X86;
+        HookDetour(datActorGetDescriptionTag);
+    }
+    fnActorGetDescriptionTag_.SetFn(datActorGetDescriptionTag.realFn_);
+    LOGF("DetourCommon: Actor::GetDescriptionTag %s\n",
+         datActorGetDescriptionTag.realFn_ ? "OK" : "MISSING (names fallback to record)");
+
+    HookDetour(datLocMgrInstance);
+    if (datLocMgrInstance.realFn_ == NULL)
+    {
+        datLocMgrInstance.mangleName_ = SYM_LOCMGR_INSTANCE_X86;
+        HookDetour(datLocMgrInstance);
+    }
+    fnLocMgrInstance_.SetFn(datLocMgrInstance.realFn_);
+
+    HookDetour(datLocMgrLocalize);
+    if (datLocMgrLocalize.realFn_ == NULL)
+    {
+        datLocMgrLocalize.mangleName_ = SYM_LOCMGR_LOCALIZE_X86;
+        HookDetour(datLocMgrLocalize);
+    }
+    fnLocMgrLocalize_.SetFn(datLocMgrLocalize.realFn_);
+    LOGF("DetourCommon: LocalizationManager %s\n",
+         (datLocMgrInstance.realFn_ && datLocMgrLocalize.realFn_) ? "OK" : "MISSING");
+
     if (status != 0)
     {
         OutputDebugStringA("DetourCommon::SetupDetour - WARNING: some functions not found (non-fatal)\n");
@@ -109,12 +190,21 @@ void DetourCommon::Update(void *player, int idx)
 
 unsigned int DetourCommon::GetObjectId(void* obj) const
 {
-    return fnGetObjectId_.Fn_(obj);
+    if (!obj || !DetourUtil::MemValidity(obj) || !fnGetObjectId_.Fn_)
+    {
+        return 0;
+    }
+    return SEH_CallObjId((RawObjIdFn)fnGetObjectId_.Fn_, obj);
 }
 
 void DetourCommon::GetObjectName(void* obj, std::string &name)
 {
-    const char *objname = fnObjectGetObjectName_.Fn_(obj);
+    if (!obj || !DetourUtil::MemValidity(obj) || !fnObjectGetObjectName_.Fn_)
+    {
+        name = "*";
+        return;
+    }
+    const char *objname = SEH_CallObjName((RawObjNameFn)fnObjectGetObjectName_.Fn_, obj);
 
     if (objname)
     {
@@ -137,32 +227,124 @@ void DetourCommon::GetObjectName(void* obj, std::string &name)
     }
 }
 
+bool DetourCommon::GetEntityDisplayName(void* entity, char* out, int outSize) const
+{
+    if (out && outSize > 0)
+        out[0] = '\0';
+    if (!entity || !out || outSize <= 0 || !fnActorGetDescriptionTag_.Fn_ ||
+        !fnLocMgrInstance_.Fn_ || !fnLocMgrLocalize_.Fn_)
+        return false;
+
+    __try
+    {
+        const char *tag = fnActorGetDescriptionTag_.Fn_(entity);
+        if (!tag || !tag[0])
+            return false;
+        // Parameterized tags ("%s ...") cannot be called with zero varargs.
+        if (strchr(tag, '%'))
+            return false;
+        void *locMgr = fnLocMgrInstance_.Fn_();
+        if (!locMgr)
+            return false;
+        const wchar_t *w = fnLocMgrLocalize_.Fn_(locMgr, tag);
+        if (!w || !w[0])
+            return false;
+        char *conv = DetourUtil::WStr2CharStr("%ls", (const wchar_t*)w);
+        if (!conv || !conv[0])
+            return false;
+        strncpy_s(out, outSize, conv, _TRUNCATE);
+        return out[0] != '\0';
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        if (out && outSize > 0)
+            out[0] = '\0';
+        return false;
+    }
+}
+
 
 const char* DetourCommon::GetSkillName(void* skillptr)
 {
-    if (!skillptr)
+    return GetSafeSkillName(skillptr);
+}
+
+bool DetourCommon::GetSkillRecord(void* skillptr, std::string &record) const
+{
+    record.clear();
+    if (!skillptr || !DetourUtil::MemValidity(skillptr) || !fnObjectGetObjectName_.Fn_)
+    {
+        return false;
+    }
+    // skptr[1] is the record filename per decompile; use API, not raw deref
+    const char *objname = SEH_CallObjName((RawObjNameFn)fnObjectGetObjectName_.Fn_, skillptr);
+    if (!objname || !DetourUtil::MemValidity((void*)objname))
+    {
+        return false;
+    }
+    // Copy with length cap: record strings are short paths; avoid huge copy on corrupt ptr
+    size_t len = 0;
+    while (len < 512 && objname[len] != '\0')
+    {
+        ++len;
+    }
+    if (len == 0 || len >= 512)
+    {
+        return false;
+    }
+    record.assign(objname, len);
+    return !record.empty();
+}
+
+const char* DetourCommon::GetSafeSkillName(void* skillptr)
+{
+    if (!skillptr || !DetourUtil::MemValidity(skillptr) || !fnGenerateUISkillInfo_)
     {
         return "null";
     }
 
     unsigned char skillbuf[STR_BUF_SIZE] = { 0 };
 
-    fnGenerateUISkillInfo_(skillptr, (unsigned int&)skillbuf);
+    if (!SEH_CallSkillInfo((RawSkillInfoFn)fnGenerateUISkillInfo_, skillptr, (unsigned int&)skillbuf))
+    {
+        return "null";
+    }
 
+    // skillbuf[0] holds pointer to wide text; validate before touching.
+    unsigned int ptrVal = ((unsigned int*)&skillbuf)[0];
+    if (ptrVal < 0x10000 || !DetourUtil::MemValidity((void*)ptrVal))
+    {
+        return "null";
+    }
     //what's returned are double wide chars, convert this to single wide char
-    const unsigned short *uname = (const unsigned short*)(((unsigned int*)&skillbuf)[0]);
+    const unsigned short *uname = (const unsigned short*)ptrVal;
+    if (!DetourUtil::MemValidity((void*)uname) || !DetourUtil::MemValidity((void*)(uname + 2)))
+    {
+        return "null";
+    }
     uname += 0x2;
 
     unsigned int* uptr = (unsigned int*)uname;
+    if (!DetourUtil::MemValidity(uptr))
+    {
+        return "null";
+    }
     unsigned int memval = (unsigned int)uptr[0];
     bool isWideChar = (memval & 0xff000000) != 0;
 
-    std::wstring &wname = *(std::wstring*)uname;
-
-    //convert to char string
     if (isWideChar)
     {
-        char *converted = DetourUtil::WStr2CharStr("%ls", wname);
+        // wstring lives in game heap: validate begin/end before formatting.
+        const wchar_t* wbegin = (const wchar_t*)uname;
+        if (!DetourUtil::MemValidity((void*)wbegin))
+        {
+            return "null";
+        }
+        char *converted = DetourUtil::WStr2CharStr("%ls", wbegin);
+        if (!converted)
+        {
+            return "null";
+        }
         sprintf_s(wcharbuff, STR_BUF_SIZE - 1, "%s", converted);
     }
     else
@@ -170,12 +352,18 @@ const char* DetourCommon::GetSkillName(void* skillptr)
         //copy unsigned as char
         for (int i = 0; i < STR_BUF_SIZE; ++i)
         {
+            if (!DetourUtil::MemValidity((void*)&uname[i]))
+            {
+                wcharbuff[i] = '\0';
+                break;
+            }
             const unsigned short v = uname[i];
             char c = (char)v;
             wcharbuff[i] = c;
             if (v == 0)
             break;
         }
+        wcharbuff[STR_BUF_SIZE - 1] = '\0';
     }
 
     //strip out '(' 
@@ -183,7 +371,7 @@ const char* DetourCommon::GetSkillName(void* skillptr)
     {
         if (wcharbuff[i] == '(')
         {
-            if (wcharbuff[i - 1] == ' ')
+            if (i > 0 && wcharbuff[i - 1] == ' ')
             {
                 wcharbuff[i - 1] = '\0';
             }
@@ -191,6 +379,10 @@ const char* DetourCommon::GetSkillName(void* skillptr)
             {
                 wcharbuff[i] = '\0';
             }
+            break;
+        }
+        if (wcharbuff[i] == '\0')
+        {
             break;
         }
     }
@@ -226,42 +418,54 @@ float DetourCommon::CharBioGetBonusLifeAmount(void *charBio, unsigned int& bonus
 
 void* DetourCommon::CharacterGetCombatManager(void* charPtr) const
 {
-    return fnCharacterGetCombatManager_.Fn_(charPtr);
+    if (!charPtr || !DetourUtil::MemValidity(charPtr)) return 0;
+    return SEH_CallMgr((RawMgrFn)fnCharacterGetCombatManager_.Fn_, charPtr);
 }
 unsigned int DetourCommon::CombatMgrGetAttackerId(void* This) const
 {
-    return fnCombatMgrGetAttackerId_.Fn_(This);
+    if (!This || !DetourUtil::MemValidity(This)) return 0;
+    __try { return fnCombatMgrGetAttackerId_.Fn_(This); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
 
 void* DetourCommon::CombatManagerGetCharacter(void* This) const
 {
-    return fnCombatManagerGetCharacter_.Fn_(This);
+    if (!This || !DetourUtil::MemValidity(This)) return 0;
+    return SEH_CallMgr((RawMgrFn)fnCombatManagerGetCharacter_.Fn_, This);
 }
 
 int DetourCommon::SkillTrackableTotalTime(void* This, unsigned int a) const
 {
-    return fnSkillTrackableTotalTime_.Fn_(This, a);
+    if (!This || !DetourUtil::MemValidity(This)) return 0;
+    __try { return fnSkillTrackableTotalTime_.Fn_(This, a); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
 
 
 float DetourCommon::SkillGetCooldownCompletion(void* This) const
 {
-    return fnSkillGetCooldownCompletion_.Fn_(This);
+    if (!This || !DetourUtil::MemValidity(This)) return 0.0f;
+    __try { return fnSkillGetCooldownCompletion_.Fn_(This); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0.0f; }
 }
 
 int DetourCommon::SkillGetCooldownRemaining(void* This) const
 {
-    return fnSkillGetCooldownRemaining_.Fn_(This);
+    if (!This || !DetourUtil::MemValidity(This)) return 0;
+    return SEH_CallCooldown((RawCooldownFn)fnSkillGetCooldownRemaining_.Fn_, This);
 }
 
 float DetourCommon::SkillGetCooldownTime(void* This, bool flag) const
 {
-    return fnSkillGetCooldownTime_.Fn_(This, flag);
+    if (!This || !DetourUtil::MemValidity(This)) return 0.0f;
+    __try { return fnSkillGetCooldownTime_.Fn_(This, flag); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0.0f; }
 }
 
 int DetourCommon::SkillGetCooldownTotal(void* This) const
 {
-    return fnSkillGetCooldownTotal_.Fn_(This);
+    if (!This || !DetourUtil::MemValidity(This)) return 0;
+    return SEH_CallCooldown((RawCooldownFn)fnSkillGetCooldownTotal_.Fn_, This);
 }
 
 int DetourCommon::GetGameTime() const

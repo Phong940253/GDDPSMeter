@@ -12,6 +12,23 @@
 //=============================================================================
 #define SKILL_UPDATE_INTERVAL 100
 
+// SEH helper: POD-only so __try is legal. Raw timer slots uptr[219/226]
+// can point at freed proc-skill memory; validate + read here, callers
+// with maps/strings stay __try-free (C2712).
+namespace
+{
+bool SEH_ReadTimerSlot(void* base, int idx, int* out)
+{
+    if (!base || !out || idx < 0 || idx > 1024) return false;
+    __try
+    {
+        *out = (int)((unsigned int*)base)[idx];
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+} // namespace
+
 //=============================================================================
 //=============================================================================
 DetourFnData datCharacterDispelSkillBuffs = { "game.dll", NULL, (VoidFn)&DetourSkill::DTCharacterDispelSkillBuffs,SYM_CHARACTER_DISPELSKILLBUFFS  };
@@ -118,6 +135,10 @@ bool DetourSkill::SetupDetour()
 
 void DetourSkill::SendSkillBuffMessage(void* skillPtr, int timeRemaining, bool isActiveBuff, bool remove)
 {
+    if (!skillPtr || !DetourUtil::MemValidity(skillPtr))
+    {
+        return;
+    }
     IPCData ipc;
 
     ipc.msg_ = isActiveBuff ? ActiveSkillBuff : SkillBuffCooldown;
@@ -127,8 +148,16 @@ void DetourSkill::SendSkillBuffMessage(void* skillPtr, int timeRemaining, bool i
         ipc.msg_ = isActiveBuff ? ActiveSkillBuffRemove : SkillBuffCooldownRemove;
     }
  
-    unsigned int id = pDetourCommon_->GetObjectId(skillPtr);
-    snprintf(ipc.u_.skillBuff_.name_, IPCNAME_SIZE - 1, "%s", pDetourCommon_->GetSkillName(skillPtr));
+    unsigned int id = 0;
+    const char *sname = "null";
+    // Callees are SEH-hardened; no __try here (IPCData needs unwinding).
+    id = pDetourCommon_->GetObjectId(skillPtr);
+    sname = pDetourCommon_->GetSkillName(skillPtr);
+    if (id == 0 || !sname)
+    {
+        return;
+    }
+    snprintf(ipc.u_.skillBuff_.name_, IPCNAME_SIZE - 1, "%s", sname);
     ipc.u_.skillBuff_.skillId_ = id;
     ipc.u_.skillBuff_.timeRemaining_ = timeRemaining;
   
@@ -157,13 +186,24 @@ void DetourSkill::Update(void *player, int idx)
             skillBuffData &data = itr->second;
 
             //skillbuffself timer offset = 226 (per uint alignment, 4 bytes ea.)
-            unsigned int *uptr = (unsigned int*)data.skillptr_;
-            int durtime = (int)uptr[226];
+            // Proc skills (e.g. Doom Bolt item proc) can free/reuse memory:
+            // validate before raw deref, drop entry instead of crashing.
+            if (!data.skillptr_ || !DetourUtil::MemValidity(data.skillptr_) ||
+                !DetourUtil::MemValidity((unsigned int*)data.skillptr_ + 226))
+            {
+                itr = skillSelfBuffMap_.erase(itr);
+                continue;
+            }
+            int durtime = 0;
+            if (!SEH_ReadTimerSlot(data.skillptr_, 226, &durtime))
+            {
+                itr = skillSelfBuffMap_.erase(itr);
+                continue;
+            }
 
             if (durtime > 0)
             {
                 int cdr = pDetourCommon_->SkillGetCooldownRemaining(data.skillptr_);
-                data.CDRemaining_ = durtime;
                 SendSkillBuffMessage(data.skillptr_, data.CDRemaining_, true, false);
                 ++itr;
             }
@@ -171,7 +211,7 @@ void DetourSkill::Update(void *player, int idx)
             {
                 SendSkillBuffMessage(data.skillptr_, 0, true, true);
 
-                if (data.parentSkill_)
+                if (data.parentSkill_ && DetourUtil::MemValidity(data.parentSkill_))
                 {
                     if (IsValidSkillToMonitor(data.parentSkill_))
                     {
@@ -201,9 +241,20 @@ void DetourSkill::Update(void *player, int idx)
             //skillbuff timer offset = 219 (per uint alignment, 4 bytes ea.)
             unsigned int skillId = itr->first;
             skillBuffData &data = itr->second;
-            unsigned int *uptr = (unsigned int*)data.skillptr_;
-            int durtime = (int)uptr[219];
-            int cdr = pDetourCommon_->SkillGetCooldownRemaining(data.skillptr_);
+            if (!data.skillptr_ || !DetourUtil::MemValidity(data.skillptr_) ||
+                !DetourUtil::MemValidity((unsigned int*)data.skillptr_ + 219))
+            {
+                itr = skillBuffMap_.erase(itr);
+                continue;
+            }
+            int durtime = 0;
+            int cdr = 0;
+            if (!SEH_ReadTimerSlot(data.skillptr_, 219, &durtime))
+            {
+                itr = skillBuffMap_.erase(itr);
+                continue;
+            }
+            cdr = pDetourCommon_->SkillGetCooldownRemaining(data.skillptr_);
 
             if (durtime > 0)
             {
@@ -215,7 +266,7 @@ void DetourSkill::Update(void *player, int idx)
             {
                 SendSkillBuffMessage(data.skillptr_, 0, true, true);
 
-                if (data.parentSkill_)
+                if (data.parentSkill_ && DetourUtil::MemValidity(data.parentSkill_))
                 {
                     if (IsValidSkillToMonitor(data.parentSkill_))
                     {
@@ -247,6 +298,11 @@ void DetourSkill::Update(void *player, int idx)
             //skillbuff timer offset = 219 (per uint alignment, 4 bytes ea.)
             unsigned int skillId = itr->first;
             skillBuffData &data = itr->second;
+            if (!data.skillptr_ || !DetourUtil::MemValidity(data.skillptr_))
+            {
+                itr = skillBuffCDRemainingMap_.erase(itr);
+                continue;
+            }
             int cdr = pDetourCommon_->SkillGetCooldownRemaining(data.skillptr_);
             if (cdr > 0)
             {
@@ -386,22 +442,40 @@ void DetourSkill::SetSkillMap()
 
 void DetourSkill::SetItemSkillMap()
 {
-    if (itemSkillMap_.size() == 0)
+    // Rebuild every call: equipment (e.g. Doom Bolt gloves) can change
+    // after SetupPlayer, stale map = unknown skid -> unsafe name lookup.
+    itemSkillMap_.clear();
     {
         DLOG(LogSkillBase,"SetItemSkillMap:\n");
 
-        void *skillMgr = &pDetourCommon_->CharGetSkillMgr(playerPtr_);
-        if (!skillMgr)
+        if (!playerPtr_ || !DetourUtil::MemValidity(playerPtr_))
+        {
+            return;
+        }
+        void *skillMgr = NULL;
+        // CharGetSkillMgr returns a reference to game memory; pre-validate
+        // player and rely on hardened callee (no __try here: STL in scope).
+        if (!DetourUtil::MemValidity(playerPtr_))
+        {
+            return;
+        }
+        skillMgr = &pDetourCommon_->CharGetSkillMgr(playerPtr_);
+        if (!skillMgr || !DetourUtil::MemValidity(skillMgr))
         {
             DLOG(LogSkillBase,"  skillMgr = null\n");
             return;
         }
 
-        std::vector<unsigned int*> &skillList = pDetourCommon_->SkillMgrGetItemSkillList(skillMgr);
+        std::vector<unsigned int*> *skillListPtr = &pDetourCommon_->SkillMgrGetItemSkillList(skillMgr);
+        if (!skillListPtr || !DetourUtil::MemValidity(skillListPtr))
+        {
+            return;
+        }
+        std::vector<unsigned int*> &skillList = *skillListPtr;
         unsigned int skillId = 0;
         LOGF("  item skill list size=%u", skillList.size());
 
-        if (skillList.size() == 0)
+        if (skillList.size() == 0 || skillList.size() > 4096)
         {
             DLOG(LogSkillBase,"  skillList=%d, total = 0\n", skillList);
             return;
@@ -410,37 +484,40 @@ void DetourSkill::SetItemSkillMap()
         // max size is unknown but should be a few dozen if that
         for (unsigned int i = 0; i < skillList.size(); ++i)
         {
-            //bool memvalid = DetourUtil::MemValidity((void*)skillArray[i]);
-            
-			//if (!memvalid)
-            //{
-            //    DLOG(LogSkillBase,"  [%i]item skill bad mem\n", i);
-            //    break;
-            //}
-            //unsigned int* uskptr = skillList[i];
-            //std::string recStr = (const char*)uskptr[1];
-
-
             unsigned int *skptr = (unsigned int*)skillList[i];
-            //memvalid = DetourUtil::MemValidity((void*)skptr[1]);
-            //if (skptr[1] == 0 || !memvalid)
-            //{
-             //   DLOG(LogSkillBase,"  .[%i]item skill bad mem\n", i);
-             //   break;
-            //}
+            if (!skptr || !DetourUtil::MemValidity(skptr) || !DetourUtil::MemValidity(skptr + 1))
+            {
+                continue;
+            }
+            if (skptr[1] == 0 || !DetourUtil::MemValidity((void*)skptr[1]))
+            {
+                continue;
+            }
             const char *recordPtr = (const char*)skptr[1];
-            std::string recStr = recordPtr;
+            if (!recordPtr || !DetourUtil::MemValidity((void*)recordPtr) || recordPtr[0] == '\0')
+            {
+                continue;
+            }
+            // Bound record length before std::string copy (corrupt ptr safety)
+            size_t reclen = 0;
+            while (reclen < 512 && recordPtr[reclen] != '\0')
+            {
+                ++reclen;
+            }
+            if (reclen == 0 || reclen >= 512)
+            {
+                continue;
+            }
+            std::string recStr(recordPtr, reclen);
 
             //skptr[1] points to a skill record filename
             if (recStr.find("skills") != std::string::npos)
             {
                 skillId = pDetourCommon_->GetObjectId(skptr);
-                itemSkillMap_[skillId] = skptr;
-            }
-            else
-            {
-                DLOG(LogSkillBase,"  end skills\n");
-                break;
+                if (skillId != 0)
+                {
+                    itemSkillMap_[skillId] = skptr;
+                }
             }
         }
         DLOG(LogSkillBase,"  total=%d\n", itemSkillMap_.size());
@@ -508,7 +585,20 @@ void* DetourSkill::GetItemSkillPtr(unsigned int skillId) const
 
 unsigned int DetourSkill::GetParentSkillId(void* skillPtr) const
 {
-    return fnSkillBuffGetParentSkillId_.Fn_(skillPtr);
+    // Two vtables exist (SkillBuff vs Skill_WPAttack). Never trust caller:
+    // validate + SEH, return 0 instead of crashing on item-proc attacks.
+    if (!skillPtr || !DetourUtil::MemValidity(skillPtr) || !fnSkillBuffGetParentSkillId_.Fn_)
+    {
+        return 0;
+    }
+    __try
+    {
+        return fnSkillBuffGetParentSkillId_.Fn_(skillPtr);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return 0;
+    }
 }
 
 void* DetourSkill::GetAlternateSkillPtr(unsigned int skillId)
@@ -520,7 +610,6 @@ void* DetourSkill::GetAlternateSkillPtr(unsigned int skillId)
     {
         return altSkillPtr;
     }
-    std::map<unsigned int, skillBuffData> skillBuffMap_;
     std::map<unsigned int, skillBuffData>::const_iterator itrBuffMap = skillBuffMap_.find(skillId);
     if (itrBuffMap != skillBuffMap_.end())
     {
@@ -665,9 +754,14 @@ void DetourSkill::SetActivatePetSkill(unsigned int entityId, void* skillPtr, voi
 void* DetourSkill::SkillGetManager(void* skillPtr)
 {
     void* manager = NULL;
-    if (skillPtr)
+    if (skillPtr && DetourUtil::MemValidity(skillPtr) && fnSkillGetManager_.Fn_)
     {
-        manager = fnSkillGetManager_.Fn_(skillPtr);
+        __try { manager = fnSkillGetManager_.Fn_(skillPtr); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { manager = NULL; }
+        if (manager && !DetourUtil::MemValidity(manager))
+        {
+            manager = NULL;
+        }
     }
     return manager;
 }
@@ -675,9 +769,10 @@ void* DetourSkill::SkillGetManager(void* skillPtr)
 void* DetourSkill::SkillManagerGetParent(void* skillMgr)
 {
     void* character = NULL;
-    if (skillMgr)
+    if (skillMgr && DetourUtil::MemValidity(skillMgr) && fnSkillManagerGetParent_.Fn_)
     {
-        character = fnSkillManagerGetParent_.Fn_(skillMgr);
+        __try { character = fnSkillManagerGetParent_.Fn_(skillMgr); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { character = NULL; }
     }
     return character;
 }
@@ -792,30 +887,44 @@ void DetourSkill::CharacterDispelSkillBuffs(void* charPtr)
 
 bool DetourSkill::IsValidSkillToMonitor(void *skillPtr)
 {
+    if (!skillPtr || !DetourUtil::MemValidity(skillPtr))
+    {
+        return false;
+    }
     unsigned int *uskptr = (unsigned int*)skillPtr;
-    const char *recordPtr = (const char*)uskptr[1];
-    bool valid = true;
-
+    if (!DetourUtil::MemValidity(uskptr + 1) || uskptr[1] == 0 ||
+        !DetourUtil::MemValidity((void*)uskptr[1]))
+    {
+        return false;
+    }
+    // GetSkillName is SEH-hardened at callee; no __try here (std::string in scope).
     const char *skname = pDetourCommon_->GetSkillName(skillPtr);
-    unsigned int skillid = pDetourCommon_->GetObjectId(skillPtr);
-    std::string strSkillName = skname;
+    if (!skname || !DetourUtil::MemValidity((void*)skname))
+    {
+        return false;
+    }
+    // Bound copy: game could return unterminated pointer on corrupt skill
+    size_t nlen = 0;
+    while (nlen < 64 && skname[nlen] != '\0')
+    {
+        ++nlen;
+    }
+    if (nlen == 0 || nlen >= 64)
+    {
+        return false;
+    }
+    std::string strSkillName(skname, nlen);
 
     if (strSkillName.find("devotion") == std::string::npos)
     {
-        valid = false;
+        return false;
     }
-    else
+    if (strSkillName.find("Current") != std::string::npos ||
+        strSkillName.find("Not Learned") != std::string::npos)
     {
-        //ignore 'current skill level' and 'not learned' buff names, 
-        //don't know what they are but definitely not gonna show them
-        if (strSkillName.find("Current") != std::string::npos || 
-            strSkillName.find("Not Learned") != std::string::npos)
-        {
-            valid = false;
-        }
+        return false;
     }
-
-    return valid;
+    return true;
 }
 
 void DetourSkill::AddSkillActivated(unsigned int skillId, void* parentSkillPtr)
@@ -991,16 +1100,30 @@ bool DetourSkill::GetConsumableSkillId(unsigned int skillId) const
 
 void DetourSkill::SkillBuffInstall(void* skillptr, void* charPtr)
 {
+    if (!skillptr || !DetourUtil::MemValidity(skillptr))
+    {
+        return;
+    }
     void *skillMgr = SkillGetManager(skillptr);
     void *skillcharPtr = SkillManagerGetParent(skillMgr);
 
     if (playerPtr_ == skillcharPtr)
     {
-        void *charCmbatMgr = pDetourCommon_->CharacterGetCombatManager(charPtr);
-        unsigned int attackerId = pDetourCommon_->CombatMgrGetAttackerId(charCmbatMgr);
+        // Callees SEH-hardened; no __try here (maps in scope).
+        void *charCmbatMgr = NULL;
+        unsigned int attackerId = 0;
+        if (charPtr && DetourUtil::MemValidity(charPtr))
+        {
+            charCmbatMgr = pDetourCommon_->CharacterGetCombatManager(charPtr);
+            attackerId = pDetourCommon_->CombatMgrGetAttackerId(charCmbatMgr);
+        }
         // insert player's skillBuff if skillmap is initialized
         unsigned int skillId = pDetourCommon_->GetObjectId(skillptr);
-        unsigned int parentSkillId = fnSkillBuffGetParentSkillId_.Fn_(skillptr);
+        if (skillId == 0)
+        {
+            return;
+        }
+        unsigned int parentSkillId = GetParentSkillId(skillptr);
         void* parentSkillPtr = NULL;
         void* skillPtr = GetSkillPtr(skillId);
         const char *parentName = "null";

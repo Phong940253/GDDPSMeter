@@ -10,6 +10,7 @@
 //=============================================================================
 
 class DetourMain;
+class DetourCommon;
 
 // Mangled symbols from Game.dll / Engine.dll
 #define SYM_INITIATE_PLAYER_TELEPORT  "?InitiatePlayerTeleport@GameEngine@GAME@@QAEXHHHW4TeleportEffect@2@_N@Z"
@@ -245,6 +246,7 @@ public:
     bool IsInTeleportMode() const { return inTeleportMode_; }
 
     void SetParent(DetourMain *parent) { sDetourMain_ = parent; }
+    void SetCommon(DetourCommon *common) { pCommon_ = common; }
 
 private:
     void AddToHistory(int x, int y, int z, TeleportEffect effect, bool isPersonal);
@@ -365,6 +367,7 @@ private:
     void *playerPtr_;
     void *gameEnginePtr_;  // captured from InitiatePlayerTeleport hook's This pointer
     DetourMain *sDetourMain_;
+    DetourCommon *pCommon_;  // display-name resolution (may be NULL)
 
     static DetourTeleport *sDetourTeleport_;
 
@@ -404,6 +407,8 @@ private:
     int spawnTargetCount_;
     int selectedSpawn_;
     void AddSpawnTarget(const char *name, const char *path, unsigned int level);
+    // Built-in roster seeds (added when missing, e.g. Mogara bounty).
+    void SeedBuiltins();
     // Entity::GetCoords: WorldCoords __thiscall () - origin-style triple
     static ThisFunc<void, void*, void*> fnGetCoords_;
     // WorldVec3::TranslateInRegion: void __thiscall (WorldVec3*, Vec3& delta)
